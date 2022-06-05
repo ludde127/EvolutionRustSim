@@ -82,6 +82,16 @@ impl Pair {
     fn value(val: f64) -> Self {
         Pair::new(val, val)
     }
+    
+    fn set_x(&mut self, x: f64) {
+        self.x = x;
+    }
+
+    fn set_y(&mut self, y: f64) {
+        self.y = y;
+    }
+
+    fn abs(&mut self) -> Self {self.x = self.x.abs(); self.y=self.y.abs(); self.clone()}
 }
 
 impl fmt::Display for Pair {
@@ -160,12 +170,23 @@ impl Particle {
         }
     }
 
+    fn __drag_dir(&self) -> Pair {
+        let mut d_dir = Pair::zeros();
+        if self.velocity.x < 0.0 {
+            d_dir.set_x(1.0);
+        } else {d_dir.set_x(-1.0);}
+        if self.velocity.y < 0.0 {
+            d_dir.set_y(1.0);
+        } else {d_dir.set_y(-1.0);}
+        d_dir
+    } 
+    
     fn update(&mut self) {
 
         let dt_pair = value(self.dt.elapsed().as_secs_f64());
         let mass = value(self.material.density) * value(self.size as f64);
-
-        let force = self.acceleration * mass;// - pair_drag_force(self.velocity, value(1.0));
+        
+        let force = self.acceleration * mass + self.__drag_dir() * pair_drag_force(self.velocity.abs(), value(1.0));
         self.acceleration = force / mass; // F=ma => a = F/m
         //println!("{}", self.position);
         self.velocity = self.velocity + self.acceleration * dt_pair;
