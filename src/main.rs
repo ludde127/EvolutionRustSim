@@ -13,6 +13,7 @@ use winit::window::WindowBuilder;
 use winit_input_helper::WinitInputHelper;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use winit::event::VirtualKeyCode::P;
 
 
 const WIDTH: u32 = 600;
@@ -20,6 +21,8 @@ const HEIGHT: u32 = 400;
 
 const WIDTH_AS_F64: f64 = WIDTH as f64;
 const HEIGHT_AS_F64: f64 = HEIGHT as f64;
+const WIDTH_HEIGHT: (f64, f64) = (WIDTH_AS_F64, HEIGHT_AS_F64);
+
 const PIXEL_SIZE: f64 = 8.0;
 
 const DENSITY: f64 = 997.0; // Kg/m3. waters density
@@ -108,6 +111,10 @@ impl Pair {
         }
     }
 
+    fn width_height() -> Self {
+        Pair::new(WIDTH_AS_F64, HEIGHT_AS_F64)
+    }
+
     fn to_tuple(&self) -> (f64, f64) {
         (self.x, self.y)
     }
@@ -146,6 +153,10 @@ impl Pair {
         
         temp
     }
+
+    fn modulo(&self, b: Pair) -> Self {Pair::new(self.x%b.x, self.y%b.y)}
+
+    fn squared(&self) -> Self {Pair::new(self.x*self.x, self.y*self.y)}
 }
 
 impl fmt::Display for Pair {
@@ -230,8 +241,8 @@ impl Particle {
             velocity,
             acceleration,
             material,
-            occupied_pixels: Geometry::new(position.x as u32, (position.x as u32)+size,
-                                           position.y as u32, (position.y as u32)+size),
+            occupied_pixels: Geometry::new((position.x%WIDTH_AS_F64) as u32, ((position.x%WIDTH_AS_F64) as u32)+size,
+                                           (position.y%HEIGHT_AS_F64) as u32, ((position.y%HEIGHT_AS_F64) as u32)+size),
             size,
             dt: Instant::now(),
             paused: false,
@@ -260,8 +271,6 @@ impl Particle {
 
             // Modulo position to wrap around window.
             self.position = self.position + self.velocity * dt_pair;
-            self.position.x = self.position.x % WIDTH_AS_F64;
-            self.position.y = self.position.y % HEIGHT_AS_F64;
 
             if self.position.x <= 0.0 {
                 self.position.x = WIDTH_AS_F64;
@@ -283,8 +292,10 @@ impl Particle {
     }
 
     fn __generate_occupied(&mut self) {
-        self.occupied_pixels = Geometry::new(self.position.x as u32, (self.position.x as u32)+self.size,
-                                             self.position.y as u32, (self.position.y as u32)+self.size)
+        self.occupied_pixels = Geometry::new((self.position.x%WIDTH_AS_F64) as u32,
+                                             ((self.position.x%WIDTH_AS_F64) as u32)+self.size,
+                                             (self.position.y%HEIGHT_AS_F64) as u32,
+                                             ((self.position.y%HEIGHT_AS_F64) as u32)+self.size)
     }
 
     fn approximate_position(&self) -> (u32, u32) {
@@ -381,6 +392,14 @@ impl Particles {
     }
     
     fn velocity(&self) -> Pair {self.particles.get(0).unwrap().velocity} // All should have same speeds.
+
+    fn mass(&self) -> f64 {self.particles.iter().map(|p| p.mass()).sum()}
+
+    fn mean_position(&self) -> Pair {
+        let mut mean_pos = Pair::zeros();
+        self.particles.iter().for_each(|p| mean_pos = mean_pos + p.position);
+        mean_pos/value(self.particles.len() as f64)
+    }
 }
 
 struct ObjectCoordinator {
@@ -435,11 +454,16 @@ impl ObjectCoordinator {
                 }
             }
             for (n, n2) in collisions {
-                let forces = self.objects.get(n).unwrap().velocity().clone()
-                    * value(-1.0) * self.objects.get(n2).unwrap().velocity().clone();
+                let obj1 = self.objects.get(n).unwrap();
+                let obj2 = self.objects.get(n2).unwrap();
+                let v1 = obj1.velocity();
+                let v2 = obj2.velocity();
+                let dp = obj2.mean_position()-obj1.mean_position();
 
-                self.objects.get_mut(n).unwrap().apply_force(forces*value(100.0) * value(-1.0));
-                self.objects.get_mut(n2).unwrap().apply_force(forces*value(100.0));
+                let force = (v1*value(obj1.mass())+v2*value(obj2.mass())).squared()*value(0.0001);
+
+                self.objects.get_mut(n).unwrap().apply_force(force*dp.to_dir()*value(-1.0));
+                self.objects.get_mut(n2).unwrap().apply_force(force*dp.to_dir());
 
                 println!("COLLISION");
             }
