@@ -464,8 +464,6 @@ impl ObjectCoordinator {
 
                 self.objects.get_mut(n).unwrap().apply_force(force*dp.to_dir()*value(-1.0));
                 self.objects.get_mut(n2).unwrap().apply_force(force*dp.to_dir());
-
-                println!("COLLISION");
             }
         }
     }
