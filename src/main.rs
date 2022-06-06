@@ -19,19 +19,12 @@ const WIDTH: u32 = 600;
 const HEIGHT: u32 = 400;
 
 const WIDTH_AS_F64: f64 = WIDTH as f64;
-const HEIGHT_AS_F64: f64 = WIDTH as f64;
+const HEIGHT_AS_F64: f64 = HEIGHT as f64;
 const PIXEL_SIZE: f64 = 8.0;
 
-const DRAG_COEFFICIENT: f64 = 0.0002;
+const DRAG_COEFFICIENT: f64 = 0.002;
 const DENSITY: f64 = 997.0; // Kg/m3. waters density
 const DRAG_X_DENSITY: f64 = DRAG_COEFFICIENT * DENSITY;
-
-
-fn drag_force(velocity: f64, cross_sectional_area: f64) -> f64 {
-    // TODO MAKE THIS MORE REALISTIC  https://en.wikipedia.org/wiki/Drag_(physics)
-    0.5 * velocity * velocity * cross_sectional_area * (DRAG_X_DENSITY as f64)
-
-}
 
 fn pair_drag_force(velocity: Pair, cross_sectional_area: Pair) -> Pair {
     // TODO MAKE THIS MORE REALISTIC  https://en.wikipedia.org/wiki/Drag_(physics)
@@ -56,6 +49,48 @@ struct Material {
     density: f64,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+struct Geometry {
+    x0: u32,
+    x1: u32,
+    y0: u32,
+    y1: u32,
+}
+
+impl Geometry {
+    fn new(x0: u32, x1: u32, y0: u32, y1: u32) -> Self {
+        Self {
+            x0,
+            x1,
+            y0,
+            y1
+        }
+    }
+
+    fn __x_in_geometry(&self, x: &u32) -> bool {
+
+        (&self.x0 <= x && x <= &self.x1) || // STANDARD CASE
+            ((self.x1 % WIDTH < self.x0) && // This is true if it enters from right side
+                (&(self.x1 % WIDTH) >= x && x >= &0))
+
+    }
+
+    fn __y_in_geometry(&self, y: &u32) -> bool {
+        (&self.y0 <= y && y <= &self.y1) || // STANDARD CASE
+            ((self.y1 % HEIGHT < self.y0) && // This is true if it enters from right side
+                (&(self.y1 % HEIGHT) >= y && y >= &0))
+    }
+    
+    fn contains(&self, x: &u32, y: &u32) -> bool {
+        self.__x_in_geometry(x) && self.__y_in_geometry(y)
+    }
+
+    fn dimensions(&self) -> (u32, u32) {
+        (self.x1-self.x0, self.y1-self.y0)
+    }
+
+    fn area(&self) -> u32 {(self.x1-self.x0)*(self.y1-self.y0)}
+}
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct Pair {
@@ -148,26 +183,46 @@ struct Particle {
     velocity: Pair,
     acceleration: Pair,
     material: Material,
-    occupied_pixels: (Range<u32>, Range<u32>),
+    occupied_pixels: Geometry,
     size: u32,
     dt: Instant,
-}
-
-fn upscale(x: u32, y:u32, scale: u32) -> (Range<u32>, Range<u32>) {
-    ((x..(x+scale)), (y..(y+scale))) // TODO: FIX ALL THE MODULU SHIT WHEN IT GOES OVER AN EDGE.
+    paused: bool,
+    was_paused: bool,
 }
 
 impl Particle {
-    fn new(position: Pair, velocity: Pair, acceleration: Pair, material: Material, size: u32) -> Self {
+    fn new(position: Pair, velocity: Pair, acceleration: Pair, material: Material, occupied_pixels: Geometry, size: u32) -> Self {
         Self {
             position,
             velocity,
             acceleration,
             material,
-            occupied_pixels: upscale(position.x as u32, position.y as u32, size),
+            occupied_pixels,
             size,
             dt: Instant::now(),
+            paused: false,
+            was_paused: false,
         }
+    }
+
+    fn new_square(position: Pair, velocity: Pair, acceleration: Pair, material: Material, size: u32) -> Self {
+        Self {
+            position,
+            velocity,
+            acceleration,
+            material,
+            occupied_pixels: Geometry::new(position.x as u32, (position.x as u32)+size,
+                                           position.y as u32, (position.y as u32)+size),
+            size,
+            dt: Instant::now(),
+            paused: false,
+            was_paused: false,
+        }
+    }
+
+    fn new_still_square(x: f64, y:f64, side: u32) -> Self {
+        Particle::new_square(Pair::new(x, y), Pair::zeros(),
+                             Pair::zeros(), Material{density:20.0}, side)
     }
 
     fn __drag_dir(&self) -> Pair {
@@ -182,33 +237,42 @@ impl Particle {
     } 
     
     fn update(&mut self) {
+        assert!(!self.paused, "Tried to update while paused");
+        if !self.was_paused {
+            let dt_pair = value(self.dt.elapsed().as_secs_f64());
+            let mass = value(self.material.density) * value(self.size as f64);
 
-        let dt_pair = value(self.dt.elapsed().as_secs_f64());
-        let mass = value(self.material.density) * value(self.size as f64);
-        
-        let force = self.acceleration * mass + self.__drag_dir() * pair_drag_force(self.velocity.abs(), value(1.0));
-        self.acceleration = force / mass; // F=ma => a = F/m
-        //println!("{}", self.position);
-        self.velocity = self.velocity + self.acceleration * dt_pair;
+            let force = self.acceleration * mass + self.__drag_dir() * pair_drag_force(self.velocity.abs(), value(1.0));
+            self.acceleration = force / mass; // F=ma => a = F/m
+            //println!("{}", self.position);
+            self.velocity = self.velocity + self.acceleration * dt_pair;
 
-        // Modulo position to wrap around window.
-        self.position = self.position + self.velocity * dt_pair;
-        self.position.x = self.position.x % WIDTH_AS_F64;
-        self.position.y = self.position.y % HEIGHT_AS_F64;
+            // Modulo position to wrap around window.
+            self.position = self.position + self.velocity * dt_pair;
+            self.position.x = self.position.x % WIDTH_AS_F64;
+            self.position.y = self.position.y % HEIGHT_AS_F64;
 
-        assert!(self.position.x > 0.0 && self.position.y > 0.0, "Position should be positive!");
-        self.__generate_occupied();
+            if self.position.x <= 0.0 {
+                self.position.x = WIDTH_AS_F64;
+            }
+
+            if self.position.y <= 0.0 {
+                self.position.y = HEIGHT_AS_F64;
+            }
+            assert!(self.position.x >= 0.0 && self.position.y >= 0.0, "Position should be positive!");
+            self.__generate_occupied();
+        }
+        self.was_paused = false;
         self.dt = Instant::now(); // Reset the dt
-
     }
 
     fn occupies(&self, x: &u32, y: &u32) -> bool {
-        self.occupied_pixels.0.contains(x) && self.occupied_pixels.1.contains(y)
+        self.occupied_pixels.contains(x, y)
     }
 
     fn __generate_occupied(&mut self) {
-        self.occupied_pixels =
-            upscale(self.position.x as u32, self.position.y as u32, self.size)
+        self.occupied_pixels = Geometry::new(self.position.x as u32, (self.position.x as u32)+self.size,
+                                             self.position.y as u32, (self.position.y as u32)+self.size)
     }
 
     fn approximate_position(&self) -> (u32, u32) {
@@ -223,11 +287,20 @@ impl Particle {
         self.position = position;
 
     }
+
+    fn apply_force(&mut self, force: Pair){
+        self.acceleration = self.acceleration + force/value(self.material.density * (self.size as f64));
+    }
+
+    fn toggle_pause(&mut self){
+        self.paused = !self.paused;
+        self.was_paused = !self.paused;
+    }
 }
 
 struct Particles {
     particles: Vec<Particle>,
-    all_occupied_pixels: Vec<(Range<u32>, Range<u32>)>,
+    paused: bool,
 }
 
 
@@ -240,12 +313,16 @@ impl Particles {
 
         Self {
             particles: p.clone(),
-            all_occupied_pixels: p.clone().iter().map(|p| p.occupied_pixels.clone()).collect(),
+            paused: false,
         }
     }
 
+    fn new_still_square(x:f64, y:f64, side:u32) -> Self {
+        Particles::new_square(Particle::new_still_square(x, y, side))
+    }
+
     fn default() -> Self {
-        Particles::new_square(Particle::new(
+        Particles::new_square(Particle::new_square(
             Pair { x: 35.0, y: 35.0 },
             Pair { x: 15.0, y: 15.0 },
             Pair { x: 0.0, y: 0.0 },
@@ -263,31 +340,38 @@ impl Particles {
     }
 
     fn any_occupies(&self, x: &u32, y: &u32) -> bool {
-        self.all_occupied_pixels.iter().any(|(r_x, r_y)|
-            r_x.contains(x) && r_y.contains(y))
-    }
-
-    fn __generate_occupied(&mut self) {
-        self.all_occupied_pixels = self.particles.iter().map(|p| p.occupied_pixels.clone()).collect();
+        self.particles.iter().any(|p|
+            p.occupied_pixels.contains(x, y))
     }
 
     /// Update the state of the group of particles.
     fn update(&mut self) {
         self.particles.iter_mut().for_each(|f| f.update());
-        self.__generate_occupied();
+    }
 
+    fn apply_force(&mut self, force: Pair){
+        self.particles.iter_mut().for_each(|p| p.apply_force(force));
+    }
+
+    fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        self.particles.iter_mut().for_each(|p| p.toggle_pause());
     }
 
 }
 
 struct ObjectCoordinator {
     objects: Vec<Particles>,
+    player_particles: Option<usize>,
+    paused: bool,
 }
 
 impl ObjectCoordinator {
     fn new() -> Self {
         Self {
             objects: vec![],
+            player_particles: None,
+            paused: false,
         }
     }
 
@@ -327,8 +411,24 @@ impl ObjectCoordinator {
         self.objects.push(particles);
     }
 
+    fn apply_force_to_player(&mut self, force: Pair) {
+        self.objects.get_mut(self.player_particles.unwrap()).unwrap().apply_force(force);
+    }
+
+    fn add_player(&mut self, particles: Particles) {
+        self.player_particles = Some(self.objects.len());
+        self.objects.push(particles);
+    }
+
     fn update(&mut self) {
-        self.objects.iter_mut().for_each(|p| p.update());
+        if !self.paused {
+            self.objects.iter_mut().for_each(|p| p.update());
+        }
+    }
+
+    fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        self.objects.iter_mut().for_each(|p| p.toggle_pause());
     }
 }
 
@@ -353,8 +453,15 @@ fn main() -> Result<(), Error> {
     };
 
     let mut state = ObjectCoordinator::new();
-    state.add(Particles::default());
-
+    //state.add(Particles::default());
+    state.add_player(Particles::new_square(
+        Particle::new_square(Pair { x: 50.0, y: 50.0 },
+                      Pair {x: 20.0, y: 26.0},
+                      Pair {x: 0.0, y: 0.0},
+                      Material {density: 20.0}, 55),
+    ));
+    state.add(Particles::new_still_square(WIDTH_AS_F64-12.0, HEIGHT_AS_F64-12.0, 24));
+    //state.add(Particles::new_still_square(WIDTH_AS_F64-12.0, 12.0, 24));
     event_loop.run(move |event, _, control_flow| {
         // Draw the current frame
         if let Event::RedrawRequested(_) = event {
@@ -375,7 +482,20 @@ fn main() -> Result<(), Error> {
             if input.key_pressed(VirtualKeyCode::Escape) || input.quit() {
                 *control_flow = ControlFlow::Exit;
                 return;
+            } else if input.key_pressed(VirtualKeyCode::Space) {
+                state.toggle_pause();
             }
+
+            if state.player_particles.is_none() || state.paused {
+
+            } else if input.key_held(VirtualKeyCode::Up) {
+                state.apply_force_to_player(Pair::new(0.0, -100000.0))
+            } else if input.key_held(VirtualKeyCode::Down) {
+                state.apply_force_to_player(Pair::new(0.0, 100000.0))}
+            else if input.key_held(VirtualKeyCode::Left) {
+                state.apply_force_to_player(Pair::new(-100000.0, 0.0))}
+            else if input.key_held(VirtualKeyCode::Right) {
+                state.apply_force_to_player(Pair::new(100000.0, 0.0))}
 
             // Resize the window
             if let Some(size) = input.window_resized() {
@@ -383,8 +503,11 @@ fn main() -> Result<(), Error> {
             }
 
             // Update internal state and request a redraw
+
             state.update();
             window.request_redraw();
+
+
         }
     });
 }
