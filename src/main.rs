@@ -1,20 +1,16 @@
 #![deny(clippy::all)]
 #![forbid(unsafe_code)]
-
-use std::time::{Duration, Instant};
-use std::thread::sleep;
-use std::ops::{Add, Div, Mul, Range, Sub};
+use std::time::{Instant};
+use std::ops::{Add, Div, Mul, Sub};
 use log::error;
 use pixels::{Error, Pixels, SurfaceTexture};
-use winit::dpi::{LogicalSize, Position};
+use winit::dpi::{LogicalSize};
 use winit::event::{Event, VirtualKeyCode};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::WindowBuilder;
 use winit_input_helper::WinitInputHelper;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashSet};
 use std::fmt;
-use winit::event::VirtualKeyCode::P;
-
 
 const WIDTH: u32 = 600;
 const HEIGHT: u32 = 400;
@@ -23,10 +19,9 @@ const WIDTH_AS_F64: f64 = WIDTH as f64;
 const HEIGHT_AS_F64: f64 = HEIGHT as f64;
 const WIDTH_HEIGHT: (f64, f64) = (WIDTH_AS_F64, HEIGHT_AS_F64);
 
-const PIXEL_SIZE: f64 = 8.0;
-
 const DENSITY: f64 = 997.0; // Kg/m3. waters density
 const DRAG_COEFFICIENT: f64 = 2.0;
+const PI: f64 = std::f64::consts::PI;
 
 struct RGBA {
     r: u8,
@@ -44,56 +39,212 @@ struct Pixel {
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct Material {
     density: f64,
+    elasticity: f64,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
-struct Geometry {
-    x0: u32,
-    x1: u32,
-    y0: u32,
-    y1: u32,
+impl Material {
+    fn default() -> Self {Material{density: 20.0, elasticity: 0.8}}
 }
 
-impl Geometry {
-    fn new(x0: u32, x1: u32, y0: u32, y1: u32) -> Self {
-        Self {
-            x0,
-            x1,
-            y0,
-            y1
+trait Geometry: std::fmt::Debug {
+    fn contains(&self, x: &f64, y: &f64) -> bool;
+    fn area(&self) -> f64;
+    fn center(&self) -> Pair;
+    fn _move(&mut self, x: f64, y: f64);
+    fn position(&self) -> Pair;
+    fn collided_with(&self, other: Shape) -> bool;
+    fn shape(&self) -> Shape;
+    fn modulo(&mut self);
+    fn drag_area(&self) -> f64;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Shape {
+    Rectangle(Rectangle),
+    Circle(Circle),
+}
+
+fn circle_rectangle_intersect(circle: Circle, rectangle: Rectangle) -> bool {
+    let center_dist = (circle.center()-rectangle.center()).abs();
+
+    if center_dist.x > (rectangle.length/2.0 + circle.diameter/2.0) ||
+        (center_dist.y > (rectangle.height/2.0 + circle.diameter/2.0)) {
+        false
+    } else if center_dist.x <= rectangle.length/2.0 || center_dist.y <= rectangle.height/2.0 {
+        true
+    } else {
+        (center_dist-Pair::new(rectangle.length/2.0, rectangle.height/2.0)).pythagoras()
+            <= (circle.diameter/2.0).powf(2.0)
+    }
+}
+
+fn collided(shape_one: Shape, shape_two: Shape) -> bool {
+    match shape_one {
+        Shape::Rectangle(rectangle1) => {
+            match shape_two {
+                Shape::Rectangle(rectangle2) => {
+                    rectangle1.corners().iter().any(|c| rectangle2.contains(&c.0, &c.1))
+                }
+                Shape::Circle(circle2) => {
+                    circle_rectangle_intersect(circle2, rectangle1)
+                }
+            }
+        },
+        Shape::Circle(circle1) => {
+            match shape_two {
+                Shape::Rectangle(rectangle2) => {
+                    circle_rectangle_intersect(circle1, rectangle2)
+                },
+                Shape::Circle(circle2) => {
+                    circle1.center().distance(circle2.center()) <= circle1.diameter/2.0+circle2.diameter/2.0
+                },
+            }
         }
     }
 
-    fn __x_in_geometry(&self, x: &u32) -> bool {
+}
 
-        (&self.x0 <= x && x <= &self.x1) || // STANDARD CASE
-            ((self.x1 % WIDTH < self.x0) && // This is true if it enters from right side
-                (&(self.x1 % WIDTH) >= x && x >= &0))
+#[derive(Debug, Copy, Clone, PartialEq)]
+struct Rectangle {
+    x0: f64,
+    y0: f64,
+    length: f64,
+    height: f64,
+}
 
+impl Rectangle {
+    fn new(x0: f64, y0: f64, length: f64, height: f64) -> Self {
+        Self {
+            x0,
+            y0,
+            length,
+            height
+        }
     }
 
-    fn __y_in_geometry(&self, y: &u32) -> bool {
-        (&self.y0 <= y && y <= &self.y1) || // STANDARD CASE
-            ((self.y1 % HEIGHT < self.y0) && // This is true if it enters from right side
-                (&(self.y1 % HEIGHT) >= y && y >= &0))
+    fn new_square(x: f64, y: f64, side: f64) -> Self {
+        Self {
+            x0: x,
+            y0: y,
+            length: side,
+            height: side,
+        }
     }
     
-    fn contains(&self, x: &u32, y: &u32) -> bool {
+    
+    fn __x_in_geometry(&self, x: &f64) -> bool {
+        (&self.x0 <= x && x <= &(self.x0+self.length)) || // STANDARD CASE
+            (((self.x0+self.length) % WIDTH_AS_F64 < self.x0) && // This is true if it enters from right side
+                (&((self.x0+self.length) % WIDTH_AS_F64) >= x && x >= &0.0))
+
+    }
+
+    fn __y_in_geometry(&self, y: &f64) -> bool {
+        (&self.y0 <= y && y <= &(self.y0+self.height)) || // STANDARD CASE
+            (((self.y0+self.height) % HEIGHT_AS_F64 < self.y0) && // This is true if it enters from right side
+                (&((self.y0+self.height) % HEIGHT_AS_F64) >= y && y >= &0.0))
+    }
+
+    fn corners(&self) -> Vec<(f64, f64)> {
+        let left_upper = (self.x0, self.y0);
+        let right_lower = ((self.x0+self.length)%WIDTH_AS_F64, (self.y0+self.height)%HEIGHT_AS_F64);
+        let left_lower = (self.x0, (self.y0+self.height)%HEIGHT_AS_F64);
+        let right_upper = ((self.x0+self.length)%WIDTH_AS_F64, self.y0);
+        vec![left_upper, right_lower, left_lower, right_upper]
+    }
+}
+
+impl Geometry for Rectangle {
+    fn contains(&self, x: &f64, y: &f64) -> bool {
+        // First check should be faster than lower checks.
         self.__x_in_geometry(x) && self.__y_in_geometry(y)
     }
-
-    fn dimensions(&self) -> (u32, u32) {
-        (self.x1-self.x0, self.y1-self.y0)
+    
+    fn area(&self) -> f64 {((self.x0+self.length)-self.x0)*((self.y0+self.height)-self.y0)}
+    
+    fn center(&self) -> Pair {
+        Pair::new((((self.x0+self.length) - self.x0) as f64)/2.0, (((self.y0+self.height) - self.y0) as f64)/2.0)
     }
 
-    fn area(&self) -> u32 {(self.x1-self.x0)*(self.y1-self.y0)}
+    fn _move(&mut self, x: f64, y: f64) {
+        self.x0 = x;
+        self.y0 = y;
+    }
 
-    fn corners(&self) -> Vec<(u32, u32)> {
-        let left_upper = (self.x0%WIDTH, self.y0%HEIGHT);
-        let right_lower = (self.x1%WIDTH, self.y1%HEIGHT);
-        let left_lower = (self.x0%WIDTH, self.y1%HEIGHT);
-        let right_upper = (self.x1%WIDTH, self.y0%HEIGHT);
-        vec![left_upper, right_lower, left_lower, right_upper]
+    fn position(&self) -> Pair {
+        Pair::new(self.x0, self.y0)
+    }
+
+    fn collided_with(&self, other: Shape) -> bool {
+        collided(self.shape(), other)
+    }
+
+    fn shape(&self) -> Shape {
+        Shape::Rectangle(*self)
+    }
+
+    fn modulo(&mut self) {
+        (self.x0, self.y0) = Pair::new(self.x0, self.y0).modulo_window().to_tuple();
+    }
+
+    fn drag_area(&self) -> f64 {
+        (self.length+self.height)*0.5
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+struct Circle {
+    x: f64, // Center
+    y: f64, // Center
+    diameter: f64,
+}
+
+impl Circle {
+    fn new(x: f64, y: f64, diameter: f64) -> Self {
+        Self { x, y, diameter}
+    }
+}
+
+impl Geometry for Circle {
+    fn contains(&self, x: &f64, y: &f64) -> bool {
+        // TODO FIX THIS SO IT WRAPS
+        let given = Pair::new(*x, *y);
+        let diff = self.center() - given;
+        let normal =  diff.pythagoras()<=self.diameter/2.0; // True if they lay in same modulo plane and intersect
+        normal
+    }
+
+    fn area(&self) -> f64 {
+        (self.diameter/2.0).powf(2.0)*PI
+    }
+
+    fn center(&self) -> Pair {
+        Pair::new(self.x, self.y)
+    }
+
+    fn _move(&mut self, x: f64, y: f64) {
+        self.x = x;
+        self.y = y;
+    }
+
+    fn position(&self) -> Pair {
+        self.center()
+    }
+
+    fn collided_with(&self, other: Shape) -> bool {
+        collided(self.shape(), other)
+    }
+
+    fn shape(&self) -> Shape {
+        Shape::Circle(*self)
+    }
+
+    fn modulo(&mut self) {
+        (self.x, self.y) = Pair::new(self.x, self.y).modulo_window().to_tuple();
+    }
+
+    fn drag_area(&self) -> f64 {
+        self.diameter
     }
 }
 
@@ -154,9 +305,35 @@ impl Pair {
         temp
     }
 
-    fn modulo(&self, b: Pair) -> Self {Pair::new(self.x%b.x, self.y%b.y)}
+    fn modulo(&self, b: Pair) -> Self {
+        let mut x = self.x%b.x;
+        let mut y = self.y%b.y;
+        if x < 0.0 {x = x + b.x};
+        if y < 0.0 {y = y + b.y};
+        Pair::new(x, y) // This should have the behaviour of normal modulo operations in math.
+    }
+
+    fn modulo_window(&self) -> Self { // Shorthand for fitting to the window as this is very common.
+        self.modulo(Pair::width_height())
+    }
 
     fn squared(&self) -> Self {Pair::new(self.x*self.x, self.y*self.y)}
+
+    fn distance(&self, other: Pair) -> f64 {
+        ((self.x-other.x).powf(2.0)+(self.y-other.y).powf(2.0)).sqrt()
+    }
+
+    fn pythagoras(&self) -> f64 {
+        (self.x.powf(2.0) + self.y.powf(2.0)).sqrt()
+    }
+
+    fn cross_prod(&self, other: Pair) -> f64 {
+        self.y*other.x - self.x*other.y
+    }
+
+    fn dot_prod(&self, other: Pair) -> f64 {
+        self.x*other.y + self.y*other.x
+    }
 }
 
 impl fmt::Display for Pair {
@@ -187,6 +364,25 @@ impl Mul for Pair {
     }
 }
 
+impl Mul<f64> for Pair {
+    type Output = Pair;
+
+    fn mul(self, rhs: f64) -> Pair {
+        Self {
+            x: self.x * rhs,
+            y: self.y * rhs,
+        }
+    }
+}
+
+impl Mul<Pair> for f64 {
+    type Output = Pair;
+
+    fn mul(self, rhs: Pair) -> Pair {
+        rhs * self
+    }
+}
+
 impl Div for Pair {
     type Output = Self;
 
@@ -207,57 +403,76 @@ impl Sub for Pair {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 struct Particle {
-    position: Pair,
+    geometry: Box<dyn Geometry>,
     velocity: Pair,
     acceleration: Pair,
     material: Material,
-    occupied_pixels: Geometry,
-    size: u32,
     dt: Instant,
     paused: bool,
     was_paused: bool,
 }
 
 impl Particle {
-    fn new(position: Pair, velocity: Pair, acceleration: Pair, material: Material, occupied_pixels: Geometry, size: u32) -> Self {
+    fn new(geometry: Box<dyn Geometry>, velocity: Pair, acceleration: Pair, material: Material) -> Self {
         Self {
-            position,
+            geometry,
             velocity,
             acceleration,
             material,
-            occupied_pixels,
-            size,
             dt: Instant::now(),
             paused: false,
             was_paused: false,
         }
     }
 
-    fn new_square(position: Pair, velocity: Pair, acceleration: Pair, material: Material, size: u32) -> Self {
+    fn new_square(position: Pair, velocity: Pair, acceleration: Pair, material: Material, height: f64) -> Self {
         Self {
-            position,
+            geometry: Box::new(Rectangle::new(position.x, position.x + height,
+                                                      position.y, position.y + height)),
             velocity,
             acceleration,
             material,
-            occupied_pixels: Geometry::new((position.x%WIDTH_AS_F64) as u32, ((position.x%WIDTH_AS_F64) as u32)+size,
-                                           (position.y%HEIGHT_AS_F64) as u32, ((position.y%HEIGHT_AS_F64) as u32)+size),
-            size,
             dt: Instant::now(),
             paused: false,
             was_paused: false,
         }
     }
-
-    fn new_still_square(x: f64, y:f64, side: u32) -> Self {
+    
+    fn new_still_rectangle(x: f64, y: f64, length: f64, height: f64) -> Self {
+        Self {
+            geometry: Box::new(Rectangle::new(x, x + length,
+                                                      y, y + height)),
+            velocity: Pair::zeros(),
+            acceleration: Pair::zeros(),
+            material: Material::default(),
+            dt: Instant::now(),
+            paused: false,
+            was_paused: false
+        }
+    }
+    
+    fn new_still_square(x: f64, y:f64, side: f64) -> Self {
         Particle::new_square(Pair::new(x, y), Pair::zeros(),
-                             Pair::zeros(), Material{density:20.0}, side)
+                             Pair::zeros(), Material::default(), side)
+    }
+
+    fn new_still_circle(x: f64, y: f64, diameter: f64) -> Self {
+        Self {
+            geometry: Box::new(Circle::new(x, y, diameter)),
+            velocity: Pair::zeros(),
+            acceleration: Pair::zeros(),
+            material: Material::default(),
+            dt: Instant::now(),
+            paused: false,
+            was_paused: false,
+        }
     }
 
     fn drag_force(&self) -> Pair {
         value(0.5) * self.velocity.to_dir() * value((-1.0)) *
-            self.velocity * self.velocity * value((self.size as f64) * DRAG_COEFFICIENT)
+            self.velocity * self.velocity * value(self.geometry.drag_area() * DRAG_COEFFICIENT)
     }
 
     fn update(&mut self) {
@@ -270,49 +485,25 @@ impl Particle {
             self.velocity = self.velocity + self.acceleration * dt_pair;
 
             // Modulo position to wrap around window.
-            self.position = self.position + self.velocity * dt_pair;
-
-            if self.position.x <= 0.0 {
-                self.position.x = WIDTH_AS_F64;
-            }
-
-            if self.position.y <= 0.0 {
-                self.position.y = HEIGHT_AS_F64;
-            }
+            let pos = self.geometry.position() + self.velocity * dt_pair;
+            self.geometry._move(pos.x%WIDTH_AS_F64, pos.y%HEIGHT_AS_F64);
             self.acceleration = Pair::zeros();
-            assert!(self.position.x >= 0.0 && self.position.y >= 0.0, "Position should be positive!");
-            self.__generate_occupied();
         }
         self.was_paused = false;
         self.dt = Instant::now(); // Reset the dt
     }
 
-    fn occupies(&self, x: &u32, y: &u32) -> bool {
-        self.occupied_pixels.contains(x, y)
-    }
-
-    fn __generate_occupied(&mut self) {
-        self.occupied_pixels = Geometry::new((self.position.x%WIDTH_AS_F64) as u32,
-                                             ((self.position.x%WIDTH_AS_F64) as u32)+self.size,
-                                             (self.position.y%HEIGHT_AS_F64) as u32,
-                                             ((self.position.y%HEIGHT_AS_F64) as u32)+self.size)
-    }
-
-    fn approximate_position(&self) -> (u32, u32) {
-        (self.position.x as u32, self.position.y as u32)
-    }
-
-    fn set_position_from_approximate(&mut self, approximate_pos: (u32, u32)){
-        self.position = Pair::new(approximate_pos.0 as f64, approximate_pos.1 as f64);
-    }
-
-    fn set_position(&mut self, position: Pair) {
-        self.position = position;
-
+    fn occupies(&self, x: &f64, y: &f64) -> bool {
+        self.geometry.contains(x, y)
     }
 
     fn apply_force(&mut self, force: Pair){
         self.acceleration = self.acceleration + force/value(self.mass());
+    }
+
+    fn set_velocity(&mut self, velocity: Pair) {
+        self.velocity = velocity;
+        self.acceleration = Pair::zeros(); // This is needed as the velocity was forcefully changed
     }
 
     fn toggle_pause(&mut self){
@@ -320,90 +511,15 @@ impl Particle {
         self.was_paused = !self.paused;
     }
 
-    fn mass(&self) -> f64 {self.material.density * (self.size as f64)}
+    fn mass(&self) -> f64 {self.material.density * self.geometry.area()}
 
     fn collides_with(&self, other: &Particle) -> bool {
-        self.occupied_pixels.corners().iter().any(|corner| other.occupies(&corner.0, &corner.1))
-    }
-}
-
-struct Particles {
-    particles: Vec<Particle>,
-    paused: bool,
-}
-
-
-impl Particles {
-    // This implements the behaviour for a group of particles.
-
-    fn new_square(particle: Particle) -> Self {
-        let mut p = vec![];
-        p.push(particle);
-
-        Self {
-            particles: p.clone(),
-            paused: false,
-        }
-    }
-
-    fn new_still_square(x:f64, y:f64, side:u32) -> Self {
-        Particles::new_square(Particle::new_still_square(x, y, side))
-    }
-
-    fn default() -> Self {
-        Particles::new_square(Particle::new_square(
-            Pair { x: 35.0, y: 35.0 },
-            Pair { x: 15.0, y: 15.0 },
-            Pair { x: 0.0, y: 0.0 },
-            Material { density: 15.0 },
-            32
-        ))
-    }
-
-    fn precise_occupies(&self, x: &u32, y:&u32) -> Option<&Particle> {
-        let mut found = None;
-        for particle in &self.particles {
-            if particle.occupies(x, y) {found = Some(particle); break}
-        }
-        found
-    }
-
-    fn any_occupies(&self, x: &u32, y: &u32) -> bool {
-        self.particles.iter().any(|p|
-            p.occupied_pixels.contains(x, y))
-    }
-
-    /// Update the state of the group of particles.
-    fn update(&mut self) {
-        self.particles.iter_mut().for_each(|f| f.update());
-    }
-
-    fn apply_force(&mut self, force: Pair){
-        self.particles.iter_mut().for_each(|p| p.apply_force(force));
-    }
-
-    fn toggle_pause(&mut self) {
-        self.paused = !self.paused;
-        self.particles.iter_mut().for_each(|p| p.toggle_pause());
-    }
-
-    fn collides_with(&self, other: &Particles) -> bool {
-        self.particles.iter().any(|p| other.particles.iter().any(|o| p.collides_with(o)))
-    }
-    
-    fn velocity(&self) -> Pair {self.particles.get(0).unwrap().velocity} // All should have same speeds.
-
-    fn mass(&self) -> f64 {self.particles.iter().map(|p| p.mass()).sum()}
-
-    fn mean_position(&self) -> Pair {
-        let mut mean_pos = Pair::zeros();
-        self.particles.iter().for_each(|p| mean_pos = mean_pos + p.position);
-        mean_pos/value(self.particles.len() as f64)
+        self.geometry.collided_with(other.geometry.shape())
     }
 }
 
 struct ObjectCoordinator {
-    objects: Vec<Particles>,
+    objects: Vec<Particle>,
     player_particles: Option<usize>,
     paused: bool,
 }
@@ -423,8 +539,8 @@ impl ObjectCoordinator {
     fn draw(&self, frame: &mut [u8]) {
         for (i, pixel) in frame.chunks_exact_mut(4).enumerate() {
             let i = i as u32;
-            let x = (i % WIDTH) as u32;
-            let y = (i / WIDTH) as u32;
+            let x = (i % WIDTH) as f64;
+            let y = (i / WIDTH) as f64;
             if self.any_occupies(&x, &y) {
                 pixel.copy_from_slice(&[0x5e, 0x48, 0xe8, 0xff]);
             } else {
@@ -433,8 +549,8 @@ impl ObjectCoordinator {
         }
     }
 
-    fn any_occupies(&self, x: &u32, y: &u32) -> bool {
-        self.objects.iter().any(|ps| ps.any_occupies(x, y))
+    fn any_occupies(&self, x: &f64, y: &f64) -> bool {
+        self.objects.iter().any(|ps| ps.occupies(x, y))
     }
 
     fn collision_handling(&mut self) {
@@ -456,45 +572,81 @@ impl ObjectCoordinator {
             for (n, n2) in collisions {
                 let obj1 = self.objects.get(n).unwrap();
                 let obj2 = self.objects.get(n2).unwrap();
-                let v1 = obj1.velocity();
-                let v2 = obj2.velocity();
-                let dp = obj2.mean_position()-obj1.mean_position();
+                let dist = obj1.geometry.center().distance(obj2.geometry.center());
+                let v1 = obj1.velocity;
+                let v2 = obj2.velocity;
 
-                let force = (v1*value(obj1.mass())+v2*value(obj2.mass())).squared()*value(0.0001);
+                let m1 = obj1.mass();
+                let m2 = obj2.mass();
 
-                self.objects.get_mut(n).unwrap().apply_force(force*dp.to_dir()*value(-1.0));
-                self.objects.get_mut(n2).unwrap().apply_force(force*dp.to_dir());
+                let sys_mass = m1 + m2;
+                if dist < 15.0 {
+                    // Merge them!
+                    let v_result = (m1*v1 + m2*v2)*(1.0/sys_mass);
+
+
+                    let was_player = self.player_particles.is_some() &&
+                        (self.player_particles.unwrap() == n ||
+                            self.player_particles.unwrap() == n2);
+
+                    let mean_pos = (obj1.geometry.position() + obj2.geometry.position()) * 0.5;
+
+                    let d3 = 2.0*((obj1.geometry.area() + obj2.geometry.area())/PI).sqrt(); // r**2*pi = A r**2=A/pi r = sqrt(A/pi)
+
+                    let new = Particle::new(
+                        Box::new(Circle::new(mean_pos.x, mean_pos.y, d3)),
+                        v_result, Pair::zeros(), obj1.material);
+                    self.objects.remove(n);
+                    self.objects.remove(n2-1);
+
+                    if was_player {
+                        self.add_player(new);
+                    } else {
+                        self.add(new);
+                    }
+
+                } else {
+                    let cr1 = 0.95*obj1.material.elasticity/
+                        (obj1.material.elasticity+obj2.material.elasticity);
+                    let cr2 = 0.95*obj2.material.elasticity/
+                        (obj1.material.elasticity+obj2.material.elasticity);
+                    let common_part = m1*v1 + m2*v2;
+                    let res1 = (common_part + m2*cr1 * (v2-v1))*(1.0/sys_mass);
+                    let res2 = (common_part + m1*cr2 * (v1-v2))*(1.0/sys_mass);
+                    self.objects.get_mut(n).unwrap().set_velocity(res1);
+                    self.objects.get_mut(n2).unwrap().set_velocity(res2);
+                }
             }
         }
     }
 
-    fn precise_occupies(&self, x: &u32, y: &u32) -> Vec<&Particle> {
+    fn precise_occupies(&self, x: &f64, y: &f64) -> Vec<&Particle> {
         let mut occupying = vec![];
-        for ps in &self.objects {
-            let occ = ps.precise_occupies(x, y);
-            if occ.is_some() {
-                occupying.push(occ.unwrap());
+        for p in &self.objects {
+            let occ = p.occupies(x, y);
+            if occ {
+                occupying.push(p);
             }
         }
         occupying
     }
 
-    fn add(&mut self, particles: Particles) {
-        self.objects.push(particles);
+    fn add(&mut self, particle: Particle) {
+        self.objects.push(particle);
     }
 
     fn apply_force_to_player(&mut self, force: Pair) {
         self.objects.get_mut(self.player_particles.unwrap()).unwrap().apply_force(force);
     }
 
-    fn add_player(&mut self, particles: Particles) {
+    fn add_player(&mut self, particle: Particle) {
         self.player_particles = Some(self.objects.len());
-        self.objects.push(particles);
+        self.objects.push(particle);
     }
 
     fn update(&mut self) {
         if !self.paused {
-            self.objects.iter_mut().for_each(|p| p.update());
+            self.objects.iter_mut().for_each(|p| {p.update(); p.geometry.modulo();});
             self.collision_handling();
         }
     }
@@ -520,20 +672,22 @@ fn main() -> Result<(), Error> {
     };
 
     let mut pixels = {
-        let window_size = window.inner_size();
-        let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
+        let window_width = window.inner_size();
+        let surface_texture = SurfaceTexture::new(window_width.width, window_width.height, &window);
         Pixels::new(WIDTH, HEIGHT, surface_texture)?
     };
 
     let mut state = ObjectCoordinator::new();
-    state.add(Particles::default());
-    state.add_player(Particles::new_square(
-        Particle::new_square(Pair { x: 50.0, y: 50.0 },
-                      Pair {x: 20.0, y: 26.0},
-                      Pair {x: 0.0, y: 0.0},
-                      Material {density: 20.0}, 55),
-    ));
-    //state.add(Particles::new_still_square(WIDTH_AS_F64-12.0, HEIGHT_AS_F64-12.0, 24));
+    //state.add(Particle::new_still_rectangle(150.0, 170.0, 20.0, 40.0));
+    //state.add(Particle::new_square(Pair { x: 50.0, y: 50.0 },
+    //                  Pair {x: 20.0, y: 26.0},
+    //                  Pair {x: 0.0, y: 0.0},
+    //                  Material {density: 20.0}, 55.0),
+    //);
+    state.add_player(Particle::new_still_circle(100.0, 200.0, 50.0));
+    state.add(Particle::new_still_circle(200.0, 300.0, 50.0));
+
+    //state.add(Particle::new_still_square(WIDTH_AS_F64-12.0, HEIGHT_AS_F64-12.0, 24.0));
     //state.add(Particles::new_still_square(WIDTH_AS_F64-12.0, 12.0, 24));
     event_loop.run(move |event, _, control_flow| {
         // Draw the current frame
@@ -562,17 +716,17 @@ fn main() -> Result<(), Error> {
             if state.player_particles.is_none() || state.paused {
 
             } else if input.key_held(VirtualKeyCode::Up) {
-                state.apply_force_to_player(Pair::new(0.0, -100000.0))
+                state.apply_force_to_player(Pair::new(0.0, -10000000.0))
             } else if input.key_held(VirtualKeyCode::Down) {
-                state.apply_force_to_player(Pair::new(0.0, 100000.0))}
+                state.apply_force_to_player(Pair::new(0.0, 10000000.0))}
             else if input.key_held(VirtualKeyCode::Left) {
-                state.apply_force_to_player(Pair::new(-100000.0, 0.0))}
+                state.apply_force_to_player(Pair::new(-10000000.0, 0.0))}
             else if input.key_held(VirtualKeyCode::Right) {
-                state.apply_force_to_player(Pair::new(100000.0, 0.0))}
+                state.apply_force_to_player(Pair::new(10000000.0, 0.0))}
 
-            // Resize the window
-            if let Some(size) = input.window_resized() {
-                pixels.resize_surface(size.width, size.height);
+            // Rewidth the window
+            if let Some(width) = input.window_resized() {
+                pixels.resize_surface(width.width, width.height);
             }
 
             // Update internal state and request a redraw
