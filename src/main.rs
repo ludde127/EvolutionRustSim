@@ -9,7 +9,7 @@ use winit::event::{Event, VirtualKeyCode};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::WindowBuilder;
 use winit_input_helper::WinitInputHelper;
-use std::collections::{HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 const WIDTH: u32 = 600;
@@ -56,6 +56,7 @@ trait Geometry: std::fmt::Debug {
     fn shape(&self) -> Shape;
     fn modulo(&mut self);
     fn drag_area(&self) -> f64;
+    fn corners(&self) -> Vec<(f64, f64)>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,14 +145,6 @@ impl Rectangle {
             (((self.y0+self.height) % HEIGHT_AS_F64 < self.y0) && // This is true if it enters from right side
                 (&((self.y0+self.height) % HEIGHT_AS_F64) >= y && y >= &0.0))
     }
-
-    fn corners(&self) -> Vec<(f64, f64)> {
-        let left_upper = (self.x0, self.y0);
-        let right_lower = ((self.x0+self.length)%WIDTH_AS_F64, (self.y0+self.height)%HEIGHT_AS_F64);
-        let left_lower = (self.x0, (self.y0+self.height)%HEIGHT_AS_F64);
-        let right_upper = ((self.x0+self.length)%WIDTH_AS_F64, self.y0);
-        vec![left_upper, right_lower, left_lower, right_upper]
-    }
 }
 
 impl Geometry for Rectangle {
@@ -189,6 +182,14 @@ impl Geometry for Rectangle {
 
     fn drag_area(&self) -> f64 {
         (self.length+self.height)*0.5
+    }
+
+    fn corners(&self) -> Vec<(f64, f64)> {
+        let left_upper = (self.x0, self.y0);
+        let right_lower = ((self.x0+self.length)%WIDTH_AS_F64, (self.y0+self.height)%HEIGHT_AS_F64);
+        let left_lower = (self.x0, (self.y0+self.height)%HEIGHT_AS_F64);
+        let right_upper = ((self.x0+self.length)%WIDTH_AS_F64, self.y0);
+        vec![left_upper, right_lower, left_lower, right_upper]
     }
 }
 
@@ -245,6 +246,20 @@ impl Geometry for Circle {
 
     fn drag_area(&self) -> f64 {
         self.diameter
+    }
+
+    fn corners(&self) -> Vec<(f64, f64)> {
+        /// Cornors of the smallest square which can fit the circle.
+        let x0 = self.x - self.diameter/2.0;
+        let x1 = self.x + self.diameter/2.0;
+        let y0 = self.y - self.diameter/2.0;
+        let y1 = self.y + self.diameter/2.0;
+
+        let left_upper = (x0, y0);
+        let right_lower = (x1%WIDTH_AS_F64, y1%HEIGHT_AS_F64);
+        let left_lower = (x0, y1%HEIGHT_AS_F64);
+        let right_upper = (x1%WIDTH_AS_F64, y0);
+        vec![left_upper, right_lower, left_lower, right_upper]
     }
 }
 
@@ -413,7 +428,6 @@ struct Particle {
     paused: bool,
     was_paused: bool,
 }
-
 impl Particle {
     fn new(geometry: Box<dyn Geometry>, velocity: Pair, acceleration: Pair, material: Material) -> Self {
         Self {
@@ -518,6 +532,14 @@ impl Particle {
     }
 }
 
+fn assign_to_quadrants(shape: &Box<dyn Geometry>) -> HashSet<(u8, u8)> {
+    let hs: HashSet<(u8, u8)> = HashSet::from_iter(shape.corners().iter()
+        .map(|cor| (((8.0*(cor.0)/WIDTH_AS_F64) as u8),
+                    ((6.0*(cor.1)/HEIGHT_AS_F64) as u8)))
+        );
+    hs
+}
+
 struct ObjectCoordinator {
     objects: Vec<Particle>,
     player_particles: Option<usize>,
@@ -558,10 +580,16 @@ impl ObjectCoordinator {
         if &self.objects.len() > &1 {
             let mut checked_pairs: HashSet<(usize, usize)> = HashSet::new();
             let mut collisions: HashSet<(usize, usize)> = HashSet::new();
-            for (n, particles) in self.objects.iter().enumerate() {
+
+            // Create the quadrants with the index of the particles in the storage vector instead.
+            let quadrant_assignment: HashMap<Pair, HashSet<(u8, u8)>> = HashMap::from_iter(self.objects.iter().map(|p| (p.geometry.position(), assign_to_quadrants(&p.geometry))));
+
+            for (n, particle) in self.objects.iter().enumerate() {
                 for (n2, other) in self.objects.iter().enumerate() {
-                    if n != n2 && !checked_pairs.contains(&(n, n2)) {
-                        if particles.collides_with(other) {
+                    if n != n2 && !checked_pairs.contains(&(n, n2))
+                        && !quadrant_assignment[&particle.geometry.position()].
+                            is_disjoint(&quadrant_assignment[&other.geometry.position()]){
+                        if particle.collides_with(other) {
                             collisions.insert((n, n2));
                         }
                         checked_pairs.insert((n, n2));
@@ -678,17 +706,14 @@ fn main() -> Result<(), Error> {
     };
 
     let mut state = ObjectCoordinator::new();
-    //state.add(Particle::new_still_rectangle(150.0, 170.0, 20.0, 40.0));
-    //state.add(Particle::new_square(Pair { x: 50.0, y: 50.0 },
-    //                  Pair {x: 20.0, y: 26.0},
-    //                  Pair {x: 0.0, y: 0.0},
-    //                  Material {density: 20.0}, 55.0),
-    //);
+
     state.add_player(Particle::new_still_circle(100.0, 200.0, 50.0));
     state.add(Particle::new_still_circle(200.0, 300.0, 50.0));
+    state.add(Particle::new_still_circle(100.0, 100.0, 50.0));
+    state.add(Particle::new_still_circle(50.0, 400.0, 50.0));
+    state.add(Particle::new_still_circle(300.0, 124.0, 50.0));
 
-    //state.add(Particle::new_still_square(WIDTH_AS_F64-12.0, HEIGHT_AS_F64-12.0, 24.0));
-    //state.add(Particles::new_still_square(WIDTH_AS_F64-12.0, 12.0, 24));
+
     event_loop.run(move |event, _, control_flow| {
         // Draw the current frame
         if let Event::RedrawRequested(_) = event {
@@ -733,8 +758,6 @@ fn main() -> Result<(), Error> {
 
             state.update();
             window.request_redraw();
-
-
         }
     });
 }
