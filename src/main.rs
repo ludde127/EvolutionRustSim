@@ -582,13 +582,15 @@ impl ObjectCoordinator {
             let mut collisions: HashSet<(usize, usize)> = HashSet::new();
 
             // Create the quadrants with the index of the particles in the storage vector instead.
-            let quadrant_assignment: HashMap<Pair, HashSet<(u8, u8)>> = HashMap::from_iter(self.objects.iter().map(|p| (p.geometry.position(), assign_to_quadrants(&p.geometry))));
+            let quadrant_assignment: HashMap<usize, HashSet<(u8, u8)>> =
+                HashMap::from_iter(self.objects.iter().enumerate()
+                    .map(|(n,p)| (n, assign_to_quadrants(&p.geometry))));
 
             for (n, particle) in self.objects.iter().enumerate() {
                 for (n2, other) in self.objects.iter().enumerate() {
                     if n != n2 && !checked_pairs.contains(&(n, n2))
-                        && !quadrant_assignment[&particle.geometry.position()].
-                            is_disjoint(&quadrant_assignment[&other.geometry.position()]){
+                        && !quadrant_assignment[&n].
+                            is_disjoint(&quadrant_assignment[&n2]){
                         if particle.collides_with(other) {
                             collisions.insert((n, n2));
                         }
