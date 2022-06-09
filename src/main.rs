@@ -1,5 +1,8 @@
 #![deny(clippy::all)]
 #![forbid(unsafe_code)]
+
+mod life;
+
 use std::time::{Instant};
 use std::ops::{Add, Div, Mul, Sub};
 use log::error;
@@ -43,7 +46,7 @@ struct Material {
 }
 
 impl Material {
-    fn default() -> Self {Material{density: 20.0, elasticity: 0.8}}
+    fn default() -> Self {Material{density: 20.0, elasticity: 0.1}}
 }
 
 trait Geometry: std::fmt::Debug {
@@ -54,7 +57,6 @@ trait Geometry: std::fmt::Debug {
     fn position(&self) -> Pair;
     fn collided_with(&self, other: Shape) -> bool;
     fn shape(&self) -> Shape;
-    fn modulo(&mut self);
     fn drag_area(&self) -> f64;
     fn corners(&self) -> Vec<(f64, f64)>;
 }
@@ -134,16 +136,12 @@ impl Rectangle {
     
     
     fn __x_in_geometry(&self, x: &f64) -> bool {
-        (&self.x0 <= x && x <= &(self.x0+self.length)) || // STANDARD CASE
-            (((self.x0+self.length) % WIDTH_AS_F64 < self.x0) && // This is true if it enters from right side
-                (&((self.x0+self.length) % WIDTH_AS_F64) >= x && x >= &0.0))
+        &self.x0 <= x && x <= &(self.x0+self.length)
 
     }
 
     fn __y_in_geometry(&self, y: &f64) -> bool {
-        (&self.y0 <= y && y <= &(self.y0+self.height)) || // STANDARD CASE
-            (((self.y0+self.height) % HEIGHT_AS_F64 < self.y0) && // This is true if it enters from right side
-                (&((self.y0+self.height) % HEIGHT_AS_F64) >= y && y >= &0.0))
+        &self.y0 <= y && y <= &(self.y0+self.height)
     }
 }
 
@@ -176,19 +174,15 @@ impl Geometry for Rectangle {
         Shape::Rectangle(*self)
     }
 
-    fn modulo(&mut self) {
-        (self.x0, self.y0) = Pair::new(self.x0, self.y0).modulo_window().to_tuple();
-    }
-
     fn drag_area(&self) -> f64 {
         (self.length+self.height)*0.5
     }
 
     fn corners(&self) -> Vec<(f64, f64)> {
         let left_upper = (self.x0, self.y0);
-        let right_lower = ((self.x0+self.length)%WIDTH_AS_F64, (self.y0+self.height)%HEIGHT_AS_F64);
-        let left_lower = (self.x0, (self.y0+self.height)%HEIGHT_AS_F64);
-        let right_upper = ((self.x0+self.length)%WIDTH_AS_F64, self.y0);
+        let right_lower = ((self.x0+self.length), (self.y0+self.height));
+        let left_lower = (self.x0, (self.y0+self.height));
+        let right_upper = ((self.x0+self.length), self.y0);
         vec![left_upper, right_lower, left_lower, right_upper]
     }
 }
@@ -208,7 +202,6 @@ impl Circle {
 
 impl Geometry for Circle {
     fn contains(&self, x: &f64, y: &f64) -> bool {
-        // TODO FIX THIS SO IT WRAPS
         let given = Pair::new(*x, *y);
         let diff = self.center() - given;
         let normal =  diff.pythagoras()<=self.diameter/2.0; // True if they lay in same modulo plane and intersect
@@ -240,10 +233,6 @@ impl Geometry for Circle {
         Shape::Circle(*self)
     }
 
-    fn modulo(&mut self) {
-        (self.x, self.y) = Pair::new(self.x, self.y).modulo_window().to_tuple();
-    }
-
     fn drag_area(&self) -> f64 {
         self.diameter
     }
@@ -256,9 +245,9 @@ impl Geometry for Circle {
         let y1 = self.y + self.diameter/2.0;
 
         let left_upper = (x0, y0);
-        let right_lower = (x1%WIDTH_AS_F64, y1%HEIGHT_AS_F64);
-        let left_lower = (x0, y1%HEIGHT_AS_F64);
-        let right_upper = (x1%WIDTH_AS_F64, y0);
+        let right_lower = (x1, y1);
+        let left_lower = (x0, y1);
+        let right_upper = (x1, y0);
         vec![left_upper, right_lower, left_lower, right_upper]
     }
 }
@@ -500,7 +489,7 @@ impl Particle {
 
             // Modulo position to wrap around window.
             let pos = self.geometry.position() + self.velocity * dt_pair;
-            self.geometry._move(pos.x%WIDTH_AS_F64, pos.y%HEIGHT_AS_F64);
+            self.geometry._move(pos.x, pos.y);
             self.acceleration = Pair::zeros();
         }
         self.was_paused = false;
@@ -534,8 +523,8 @@ impl Particle {
 
 fn assign_to_quadrants(shape: &Box<dyn Geometry>) -> HashSet<(u8, u8)> {
     let hs: HashSet<(u8, u8)> = HashSet::from_iter(shape.corners().iter()
-        .map(|cor| (((8.0*(cor.0)/WIDTH_AS_F64) as u8),
-                    ((6.0*(cor.1)/HEIGHT_AS_F64) as u8)))
+        .map(|cor| (((6.0*(cor.0)/WIDTH_AS_F64) as u8),
+                    ((4.0*(cor.1)/HEIGHT_AS_F64) as u8)))
         );
     hs
 }
@@ -676,7 +665,7 @@ impl ObjectCoordinator {
 
     fn update(&mut self) {
         if !self.paused {
-            self.objects.iter_mut().for_each(|p| {p.update(); p.geometry.modulo();});
+            self.objects.iter_mut().for_each(|p| p.update());
             self.collision_handling();
         }
     }
