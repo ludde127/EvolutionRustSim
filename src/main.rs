@@ -3,8 +3,9 @@
 
 mod life;
 
+use std::cmp::min;
 use std::time::{Instant};
-use std::ops::{Add, Div, Mul, Sub};
+use std::ops::{Add, Div, Mul, Range, Sub};
 use log::error;
 use pixels::{Error, Pixels, SurfaceTexture};
 use winit::dpi::{LogicalSize};
@@ -15,16 +16,17 @@ use winit_input_helper::WinitInputHelper;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-const WIDTH: u32 = 600;
-const HEIGHT: u32 = 400;
-
+const WIDTH: u32 = 1200;
+const HEIGHT: u32 = 800;
+use rand::Rng;
 const WIDTH_AS_F64: f64 = WIDTH as f64;
 const HEIGHT_AS_F64: f64 = HEIGHT as f64;
 const WIDTH_HEIGHT: (f64, f64) = (WIDTH_AS_F64, HEIGHT_AS_F64);
 
 const DENSITY: f64 = 997.0; // Kg/m3. waters density
-const DRAG_COEFFICIENT: f64 = 2.0;
+const DRAG_COEFFICIENT: f64 = 0.0;
 const PI: f64 = std::f64::consts::PI;
+const NUMBER_OF_NON_PLAYER_PARTICLES: u8 = 25;
 
 struct RGBA {
     r: u8,
@@ -46,7 +48,116 @@ struct Material {
 }
 
 impl Material {
-    fn default() -> Self {Material{density: 20.0, elasticity: 0.1}}
+    fn default() -> Self {Material{density: 20.0, elasticity: 0.01}}
+
+    fn random() -> Self {Material{
+        density: random_in_bound(2..20),
+        elasticity: random_in_bound(3..10)/10.0
+    }}
+}
+
+trait PlayableArea {
+    fn contains(&self, x: &f64, y: &f64) -> bool;
+    fn collision_with_shape(&self, shape: &Shape) -> bool;
+    fn collision_modelling(&self, particle: &mut Particle);
+    fn x_contains(&self, x: &f64) -> bool;
+    fn y_contains(&self, y: &f64) -> bool;
+    fn corners_outside_area(&self, particle: &Particle) -> Vec<(bool, bool)>;
+    //fn corners(&self) -> Vec<(f64)>;
+}
+
+struct BasicBox {
+    x0: i32,
+    y0: i32,
+    width: i32,
+    height: i32,
+}
+
+impl BasicBox {
+    fn new() -> Self {
+        Self {
+            x0: 0,
+            y0: 0,
+            width: WIDTH as i32,
+            height: HEIGHT as i32,
+        }
+    }
+}
+
+impl PlayableArea for BasicBox {
+    fn contains(&self, x: &f64, y: &f64) -> bool {
+        self.x_contains(x) && self.y_contains(y)
+    }
+
+    fn collision_with_shape(&self, shape: &Shape) -> bool {
+        // Simple check for corners, Should work for the BasicBox.
+        match shape {
+            Shape::Circle(shape) =>
+                shape.corners().iter().any(|(c0, c1)| !self.contains(c0, c1)),
+
+            Shape::Rectangle(shape) =>
+                shape.corners().iter().any(|(c0, c1)| !self.contains(c0, c1)),
+        }
+    }
+
+    fn collision_modelling(&self, particle: &mut Particle) {
+        let corner_outside_bounds = self.corners_outside_area(particle);
+
+        if corner_outside_bounds.iter().any(|(x, y)| *x || *y) {
+            // They collided, handle it!
+            let x_collision = corner_outside_bounds.iter().any(|(x, y)| *x);
+            let y_collision = corner_outside_bounds.iter().any(|(x, y)| *y);
+
+            let are_all_corners_outside =
+                corner_outside_bounds.iter().all(|(x, y)| *x && *y);
+
+            let mut current = particle.velocity;
+            if !x_collision {
+                current.set_y(-1.0*current.y);
+            }
+            if !y_collision {
+                current.set_x(-1.0*current.x);
+            }
+
+            if are_all_corners_outside {
+                particle.randomize(); // If it is completely outside the box randomize a new particle.
+            } else {
+                particle.set_velocity(current);
+                // Teleport 3 blocks away.
+                let mut tp = particle.geometry.center();
+
+                if ((self.x0 as f64) - tp.x).abs() < (((self.x0 + self.width) as f64) - tp.x).abs() {
+                    tp.set_x(tp.x + 1.0);
+                } else {
+                    tp.set_x(tp.x - 1.0);
+                }
+
+                if ((self.y0 as f64) - tp.y).abs() < (((self.y0 + self.height) as f64) - tp.y).abs() {
+                    tp.set_y(tp.y + 1.0);
+                } else {
+                    tp.set_y(tp.y - 1.0);
+                }
+                particle.set_center(tp); // Teleport it out a bit
+            }
+            //println!("Debugg {}", x_collision);
+
+        }
+    }
+
+    fn x_contains(&self, x: &f64) -> bool {
+        let x = (*x) as i32;
+        (x >= self.x0 && x <= (self.x0 + self.width))
+    }
+
+    fn y_contains(&self, y: &f64) -> bool {
+        let y = (*y) as i32;
+        (y >= self.y0 && y <= (self.y0 + self.height))
+    }
+
+    fn corners_outside_area(&self, particle: &Particle) -> Vec<(bool, bool)> {
+        Vec::from_iter(particle.geometry.corners().iter().map(
+            |(c0, c1)| (!self.x_contains(c0), !self.y_contains(c1))).into_iter())
+    }
 }
 
 trait Geometry: std::fmt::Debug {
@@ -55,7 +166,7 @@ trait Geometry: std::fmt::Debug {
     fn center(&self) -> Pair;
     fn _move(&mut self, x: f64, y: f64);
     fn position(&self) -> Pair;
-    fn collided_with(&self, other: Shape) -> bool;
+    fn collided_with(&self, other: &Shape) -> bool;
     fn shape(&self) -> Shape;
     fn drag_area(&self) -> f64;
     fn corners(&self) -> Vec<(f64, f64)>;
@@ -67,7 +178,7 @@ enum Shape {
     Circle(Circle),
 }
 
-fn circle_rectangle_intersect(circle: Circle, rectangle: Rectangle) -> bool {
+fn circle_rectangle_intersect(circle: &Circle, rectangle: &Rectangle) -> bool {
     let center_dist = (circle.center()-rectangle.center()).abs();
 
     if center_dist.x > (rectangle.length/2.0 + circle.diameter/2.0) ||
@@ -81,7 +192,7 @@ fn circle_rectangle_intersect(circle: Circle, rectangle: Rectangle) -> bool {
     }
 }
 
-fn collided(shape_one: Shape, shape_two: Shape) -> bool {
+fn collided(shape_one: &Shape, shape_two: &Shape) -> bool {
     match shape_one {
         Shape::Rectangle(rectangle1) => {
             match shape_two {
@@ -104,8 +215,9 @@ fn collided(shape_one: Shape, shape_two: Shape) -> bool {
             }
         }
     }
-
 }
+
+
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct Rectangle {
@@ -166,8 +278,8 @@ impl Geometry for Rectangle {
         Pair::new(self.x0, self.y0)
     }
 
-    fn collided_with(&self, other: Shape) -> bool {
-        collided(self.shape(), other)
+    fn collided_with(&self, other: &Shape) -> bool {
+        collided(&self.shape(), other)
     }
 
     fn shape(&self) -> Shape {
@@ -225,8 +337,8 @@ impl Geometry for Circle {
         self.center()
     }
 
-    fn collided_with(&self, other: Shape) -> bool {
-        collided(self.shape(), other)
+    fn collided_with(&self, other: &Shape) -> bool {
+        collided(&self.shape(), other)
     }
 
     fn shape(&self) -> Shape {
@@ -258,12 +370,21 @@ struct Pair {
     y: f64,
 }
 
+fn random_in_bound(range: Range<i32>) -> f64 {
+    let mut rng = rand::thread_rng();
+    rng.gen::<f64>() * ((range.end - range.start) as f64) + (range.start as f64)
+}
+
 impl Pair {
     fn new(x: f64, y: f64) -> Self {
         Self {
             x,
             y
         }
+    }
+
+    fn random_in_bound(x_range: Range<i32>, y_range: Range<i32>) -> Self {
+        Pair::new(random_in_bound(x_range), random_in_bound(y_range))
     }
 
     fn width_height() -> Self {
@@ -337,6 +458,14 @@ impl Pair {
 
     fn dot_prod(&self, other: Pair) -> f64 {
         self.x*other.y + self.y*other.x
+    }
+
+    fn inverse(&self) -> Self {
+        // Inverses the vector pair.
+        Self {
+            x: self.x * -1.0,
+            y: self.y * -1.0,
+        }
     }
 }
 
@@ -473,6 +602,23 @@ impl Particle {
         }
     }
 
+    fn new_random_circle() -> Self {
+        let diameter = random_in_bound(10..55);
+        let rand_pos = Pair::random_in_bound(
+            ((diameter*1.1) as i32)..((WIDTH_AS_F64-(diameter*1.1)) as i32),
+            ((diameter*1.1) as i32)..((HEIGHT_AS_F64-(diameter*1.1)) as i32)
+        );
+        Self {
+            geometry: Box::new(Circle::new(rand_pos.x, rand_pos.y, diameter)),
+            velocity: Pair::random_in_bound(-13..13, -13..13),
+            acceleration: Pair::zeros(),
+            material: Material::random(),
+            dt: Instant::now(),
+            paused: false,
+            was_paused: false,
+        }
+    }
+
     fn drag_force(&self) -> Pair {
         value(0.5) * self.velocity.to_dir() * value((-1.0)) *
             self.velocity * self.velocity * value(self.geometry.drag_area() * DRAG_COEFFICIENT)
@@ -517,14 +663,28 @@ impl Particle {
     fn mass(&self) -> f64 {self.material.density * self.geometry.area()}
 
     fn collides_with(&self, other: &Particle) -> bool {
-        self.geometry.collided_with(other.geometry.shape())
+        self.geometry.collided_with(&other.geometry.shape())
+    }
+
+    fn randomize(&mut self) {
+        let random_p = Particle::new_random_circle();
+        self.velocity = random_p.velocity;
+        self.material = random_p.material;
+        self.geometry = random_p.geometry;
+    }
+
+    fn set_center(&mut self, position: Pair) {
+        self.geometry._move(position.x, position.y);
     }
 }
 
-fn assign_to_quadrants(shape: &Box<dyn Geometry>) -> HashSet<(u8, u8)> {
+fn assign_to_quadrants(shape: &Box<dyn Geometry>, median_diameter: f64) -> HashSet<(u8, u8)> {
+    // Small quadrants seams to work best
+    let quadrant_width = 0.5*WIDTH_AS_F64/median_diameter;
+    let quadrant_height = 0.5*HEIGHT_AS_F64/median_diameter;
     let hs: HashSet<(u8, u8)> = HashSet::from_iter(shape.corners().iter()
-        .map(|cor| (((6.0*(cor.0)/WIDTH_AS_F64) as u8),
-                    ((4.0*(cor.1)/HEIGHT_AS_F64) as u8)))
+        .map(|cor| (((quadrant_width*(cor.0)/WIDTH_AS_F64) as u8),
+                    ((quadrant_height*(cor.1)/HEIGHT_AS_F64) as u8)))
         );
     hs
 }
@@ -532,6 +692,7 @@ fn assign_to_quadrants(shape: &Box<dyn Geometry>) -> HashSet<(u8, u8)> {
 struct ObjectCoordinator {
     objects: Vec<Particle>,
     player_particles: Option<usize>,
+    playable_area: Box<dyn PlayableArea>,
     paused: bool,
 }
 
@@ -541,6 +702,7 @@ impl ObjectCoordinator {
             objects: vec![],
             player_particles: None,
             paused: false,
+            playable_area: Box::new(BasicBox::new()),
         }
     }
 
@@ -573,8 +735,8 @@ impl ObjectCoordinator {
             // Create the quadrants with the index of the particles in the storage vector instead.
             let quadrant_assignment: HashMap<usize, HashSet<(u8, u8)>> =
                 HashMap::from_iter(self.objects.iter().enumerate()
-                    .map(|(n,p)| (n, assign_to_quadrants(&p.geometry))));
-
+                    .map(|(n,p)| (n, assign_to_quadrants(&p.geometry,
+                                                         self.mean_diameter()))));
             for (n, particle) in self.objects.iter().enumerate() {
                 for (n2, other) in self.objects.iter().enumerate() {
                     if n != n2 && !checked_pairs.contains(&(n, n2))
@@ -588,54 +750,77 @@ impl ObjectCoordinator {
                     }
                 }
             }
+            // Handle the collisions between particles.
             for (n, n2) in collisions {
-                let obj1 = self.objects.get(n).unwrap();
-                let obj2 = self.objects.get(n2).unwrap();
-                let dist = obj1.geometry.center().distance(obj2.geometry.center());
-                let v1 = obj1.velocity;
-                let v2 = obj2.velocity;
+                let obj1 = self.objects.get(n);
+                let obj2 = self.objects.get(n2);
+                if obj1.is_some() && obj2.is_some() {
+                    let obj1 = obj1.unwrap();
+                    let obj2 = obj2.unwrap();
+                    let v1 = obj1.velocity;
+                    let v2 = obj2.velocity;
 
-                let m1 = obj1.mass();
-                let m2 = obj2.mass();
+                    let m1 = obj1.mass();
+                    let m2 = obj2.mass();
 
-                let sys_mass = m1 + m2;
-                if dist < 15.0 {
-                    // Merge them!
-                    let v_result = (m1*v1 + m2*v2)*(1.0/sys_mass);
+                    let obj1_pos = obj1.geometry.position();
+                    let obj2_pos = obj2.geometry.position();
+
+                    let sys_mass = m1 + m2;
+                    if obj1.geometry.contains(&obj2_pos.x, &obj2_pos.y) ||
+                        obj2.geometry.contains(&obj1_pos.x, &obj1_pos.y) {
+                        // Merge them!
+                        let v_result = (m1 * v1 + m2 * v2) * (1.0 / sys_mass);
 
 
-                    let was_player = self.player_particles.is_some() &&
-                        (self.player_particles.unwrap() == n ||
-                            self.player_particles.unwrap() == n2);
+                        let was_player = self.player_particles.is_some() &&
+                            (self.player_particles.unwrap() == n ||
+                                self.player_particles.unwrap() == n2);
 
-                    let mean_pos = (obj1.geometry.position() + obj2.geometry.position()) * 0.5;
+                        let mean_pos = (obj1_pos + obj2_pos) * 0.5;
+                        // r**2*pi = A r**2=A/pi r = sqrt(A/pi)
+                        let d3 = 2.0 * ((obj1.geometry.area() + obj2.geometry.area()) / PI).sqrt();
 
-                    let d3 = 2.0*((obj1.geometry.area() + obj2.geometry.area())/PI).sqrt(); // r**2*pi = A r**2=A/pi r = sqrt(A/pi)
+                        let new = Particle::new(
+                            Box::new(Circle::new(mean_pos.x, mean_pos.y, d3)),
+                            v_result, Pair::zeros(), obj1.material);
+                        self.objects.remove(n);
+                        self.objects.remove(n2 - 1);
 
-                    let new = Particle::new(
-                        Box::new(Circle::new(mean_pos.x, mean_pos.y, d3)),
-                        v_result, Pair::zeros(), obj1.material);
-                    self.objects.remove(n);
-                    self.objects.remove(n2-1);
-
-                    if was_player {
-                        self.add_player(new);
+                        if was_player {
+                            self.add_player(new);
+                        } else {
+                            self.add(new);
+                        }
                     } else {
-                        self.add(new);
-                    }
+                        let cr1 = 2.0 * obj1.material.elasticity /
+                            (obj1.material.elasticity + obj2.material.elasticity);
+                        let cr2 = 2.0 * obj2.material.elasticity /
+                            (obj1.material.elasticity + obj2.material.elasticity);
+                        let common_part = m1 * v1 + m2 * v2;
+                        let res1 = (common_part + m2 * cr1 * (v2 - v1)) * (1.0 / sys_mass);
+                        let res2 = (common_part + m1 * cr2 * (v1 - v2)) * (1.0 / sys_mass);
 
-                } else {
-                    let cr1 = 0.95*obj1.material.elasticity/
-                        (obj1.material.elasticity+obj2.material.elasticity);
-                    let cr2 = 0.95*obj2.material.elasticity/
-                        (obj1.material.elasticity+obj2.material.elasticity);
-                    let common_part = m1*v1 + m2*v2;
-                    let res1 = (common_part + m2*cr1 * (v2-v1))*(1.0/sys_mass);
-                    let res2 = (common_part + m1*cr2 * (v1-v2))*(1.0/sys_mass);
-                    self.objects.get_mut(n).unwrap().set_velocity(res1);
-                    self.objects.get_mut(n2).unwrap().set_velocity(res2);
+                        // Teleport a bit to try to mitigate the stickiness
+
+                        {
+                            let mut obj1 = self.objects.get_mut(n).unwrap();
+                            obj1.set_velocity(res1);
+                            obj1.set_center(obj1.geometry.center()+res1.to_dir());
+                        }
+                        {
+                            let mut obj2 = self.objects.get_mut(n2).unwrap();
+                            obj2.set_velocity(res2);
+
+                            obj2.set_center(obj2.geometry.center()+res2.to_dir());
+                        }
+
+                    }
                 }
             }
+        // Detect and model impact between playable area and particle.
+        self.objects.iter_mut().for_each(|particle|
+            self.playable_area.collision_modelling(particle));
         }
     }
 
@@ -652,6 +837,29 @@ impl ObjectCoordinator {
 
     fn add(&mut self, particle: Particle) {
         self.objects.push(particle);
+    }
+    fn try_add(&mut self, particle: Particle) -> bool {
+        if self.playable_area.collision_with_shape(&particle.geometry.shape()) {
+            false
+        } else {
+            let coll = self.objects.iter().any(|p| p.collides_with(&particle));
+            if !coll {
+                self.add(particle);
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    fn mean_diameter(&self) -> f64 {
+        let mut diameter_sum = 0.0;
+        let mut diameter_count = 0.0;
+        for obj in &self.objects {
+            diameter_sum += obj.geometry.drag_area();
+            diameter_count += 1.0;
+        }
+        diameter_sum/diameter_count
     }
 
     fn apply_force_to_player(&mut self, force: Pair) {
@@ -698,12 +906,14 @@ fn main() -> Result<(), Error> {
 
     let mut state = ObjectCoordinator::new();
 
-    state.add_player(Particle::new_still_circle(100.0, 200.0, 50.0));
-    state.add(Particle::new_still_circle(200.0, 300.0, 50.0));
-    state.add(Particle::new_still_circle(100.0, 100.0, 50.0));
-    state.add(Particle::new_still_circle(50.0, 400.0, 50.0));
-    state.add(Particle::new_still_circle(300.0, 124.0, 50.0));
+    state.add_player(Particle::new_random_circle());
 
+    for n in 0..NUMBER_OF_NON_PLAYER_PARTICLES {
+        let mut added = false;
+        while !added {
+            added = state.try_add(Particle::new_random_circle());
+        }
+    }
 
     event_loop.run(move |event, _, control_flow| {
         // Draw the current frame
@@ -739,6 +949,15 @@ fn main() -> Result<(), Error> {
                 state.apply_force_to_player(Pair::new(-10000000.0, 0.0))}
             else if input.key_held(VirtualKeyCode::Right) {
                 state.apply_force_to_player(Pair::new(10000000.0, 0.0))}
+            else if  input.key_pressed(VirtualKeyCode::Key1) {
+                // Decrease energy in system
+                state.objects.iter_mut().for_each(|p| p.set_velocity(p.velocity*0.95));
+            } else if input.key_pressed(VirtualKeyCode::Key2) {
+                state.objects.iter_mut().for_each(|p| p.set_velocity(p.velocity*1.05));
+            } else if input.key_pressed(VirtualKeyCode::S) {
+                state.add(Particle::new_random_circle());
+            }
+
 
             // Rewidth the window
             if let Some(width) = input.window_resized() {
