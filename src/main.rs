@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 
 mod life;
+mod mapped_pair;
+//mod mapped_pair;
 
 use std::cmp::min;
 use std::time::{Instant};
@@ -19,6 +21,8 @@ use std::fmt;
 const WIDTH: u32 = 1200;
 const HEIGHT: u32 = 800;
 use rand::Rng;
+use crate::mapped_pair::MappedPair;
+
 const WIDTH_AS_F64: f64 = WIDTH as f64;
 const HEIGHT_AS_F64: f64 = HEIGHT as f64;
 const WIDTH_HEIGHT: (f64, f64) = (WIDTH_AS_F64, HEIGHT_AS_F64);
@@ -26,7 +30,9 @@ const WIDTH_HEIGHT: (f64, f64) = (WIDTH_AS_F64, HEIGHT_AS_F64);
 const DENSITY: f64 = 997.0; // Kg/m3. waters density
 const DRAG_COEFFICIENT: f64 = 0.0;
 const PI: f64 = std::f64::consts::PI;
-const NUMBER_OF_NON_PLAYER_PARTICLES: u8 = 25;
+const NUMBER_OF_NON_PLAYER_PARTICLES: u8 = 15;
+
+const TELEPORT_SHORT_DISTANCE_ON_IMPACT: bool = false;
 
 struct RGBA {
     r: u8,
@@ -108,8 +114,7 @@ impl PlayableArea for BasicBox {
             let x_collision = corner_outside_bounds.iter().any(|(x, y)| *x);
             let y_collision = corner_outside_bounds.iter().any(|(x, y)| *y);
 
-            let are_all_corners_outside =
-                corner_outside_bounds.iter().all(|(x, y)| *x && *y);
+
 
             let mut current = particle.velocity;
             if !x_collision {
@@ -119,10 +124,17 @@ impl PlayableArea for BasicBox {
                 current.set_x(-1.0*current.x);
             }
 
-            if are_all_corners_outside {
-                particle.randomize(); // If it is completely outside the box randomize a new particle.
-            } else {
-                particle.set_velocity(current);
+            if !x_collision && !y_collision {
+                let are_all_corners_outside =
+                    corner_outside_bounds.iter().all(|(x, y)| *x && *y);
+                if are_all_corners_outside {
+                    particle.randomize();
+                    return;
+                }
+            }
+
+            particle.set_velocity(current);
+            if TELEPORT_SHORT_DISTANCE_ON_IMPACT {
                 // Teleport 3 blocks away.
                 let mut tp = particle.geometry.center();
 
@@ -157,6 +169,25 @@ impl PlayableArea for BasicBox {
     fn corners_outside_area(&self, particle: &Particle) -> Vec<(bool, bool)> {
         Vec::from_iter(particle.geometry.corners().iter().map(
             |(c0, c1)| (!self.x_contains(c0), !self.y_contains(c1))).into_iter())
+    }
+}
+
+trait RemoveMultiple <T> {
+    fn remove_multiple_borrowed_values(&mut self, indexes: &HashSet<usize>) -> Vec<&T>;
+}
+
+impl <T> RemoveMultiple <T> for Vec<T> {
+    fn remove_multiple_borrowed_values(&mut self, indexes: &HashSet<usize>) -> Vec<&T> {
+        assert!(indexes.len() <= self.len(),
+                "Indexes to remove must be fewer than the existing indexes.");
+        let mut new_vec:Vec<&T> = Vec::with_capacity(self.len()-indexes.len());
+
+        for index in 0..(new_vec.len()-1) {
+            if !indexes.contains(&index) {
+                new_vec.push(self.get(index).unwrap());
+            }
+        }
+        new_vec
     }
 }
 
@@ -537,12 +568,37 @@ impl Sub for Pair {
 }
 
 #[derive(Debug)]
+struct Controller {
+    is_player_controlled: bool, // Usize is here to later allow more players than one
+    id: Option<usize>,
+}
+
+impl Controller {
+    fn unset_player() -> Self {
+        Self {is_player_controlled: false, id: None}
+    }
+    
+    fn not_player(id: usize) -> Self {
+        Self {is_player_controlled: false, id: Some(id)}
+    }
+
+    fn player(id: usize) -> Self {
+        Self {is_player_controlled: true, id: Some(id)}
+    }
+    
+    fn get_id(&self) -> usize {
+        self.id.unwrap()
+    }
+}
+
+#[derive(Debug)]
 struct Particle {
     geometry: Box<dyn Geometry>,
     velocity: Pair,
     acceleration: Pair,
     material: Material,
     dt: Instant,
+    controller: Controller,
     paused: bool,
     was_paused: bool,
 }
@@ -554,6 +610,7 @@ impl Particle {
             acceleration,
             material,
             dt: Instant::now(),
+            controller: Controller::unset_player(),
             paused: false,
             was_paused: false,
         }
@@ -567,6 +624,7 @@ impl Particle {
             acceleration,
             material,
             dt: Instant::now(),
+            controller: Controller::unset_player(),
             paused: false,
             was_paused: false,
         }
@@ -579,6 +637,7 @@ impl Particle {
             velocity: Pair::zeros(),
             acceleration: Pair::zeros(),
             material: Material::default(),
+            controller: Controller::unset_player(),
             dt: Instant::now(),
             paused: false,
             was_paused: false
@@ -599,6 +658,7 @@ impl Particle {
             dt: Instant::now(),
             paused: false,
             was_paused: false,
+            controller: Controller::unset_player(),
         }
     }
 
@@ -616,8 +676,11 @@ impl Particle {
             dt: Instant::now(),
             paused: false,
             was_paused: false,
+            controller: Controller::unset_player(),
         }
     }
+
+    fn set_as_player(&mut self, id: usize) {self.controller = Controller::player(id)}
 
     fn drag_force(&self) -> Pair {
         value(0.5) * self.velocity.to_dir() * value((-1.0)) *
@@ -691,8 +754,9 @@ fn assign_to_quadrants(shape: &Box<dyn Geometry>, median_diameter: f64) -> HashS
 
 struct ObjectCoordinator {
     objects: Vec<Particle>,
-    player_particles: Option<usize>,
     playable_area: Box<dyn PlayableArea>,
+    last_collisions: HashSet<MappedPair<usize>>, // Holds last checks collision
+    max_used_id: u32,
     paused: bool,
 }
 
@@ -700,9 +764,10 @@ impl ObjectCoordinator {
     fn new() -> Self {
         Self {
             objects: vec![],
-            player_particles: None,
             paused: false,
             playable_area: Box::new(BasicBox::new()),
+            last_collisions: HashSet::new(),
+            max_used_id: 0
         }
     }
 
@@ -729,8 +794,9 @@ impl ObjectCoordinator {
     fn collision_handling(&mut self) {
         // TODO MAKE THIS MORE EFFICIENT
         if &self.objects.len() > &1 {
-            let mut checked_pairs: HashSet<(usize, usize)> = HashSet::new();
-            let mut collisions: HashSet<(usize, usize)> = HashSet::new();
+            let mut valid_collisions: HashSet<MappedPair<usize>> = HashSet::new();
+            let mut checked_pairs: HashSet<MappedPair<usize>> = HashSet::new();
+            let mut collisions: HashSet<MappedPair<usize>> = HashSet::new();
 
             // Create the quadrants with the index of the particles in the storage vector instead.
             let quadrant_assignment: HashMap<usize, HashSet<(u8, u8)>> =
@@ -739,89 +805,117 @@ impl ObjectCoordinator {
                                                          self.mean_diameter()))));
             for (n, particle) in self.objects.iter().enumerate() {
                 for (n2, other) in self.objects.iter().enumerate() {
-                    if n != n2 && !checked_pairs.contains(&(n, n2))
+                    if n != n2 && !checked_pairs.contains(&MappedPair::new(n, n2))
                         && !quadrant_assignment[&n].
                             is_disjoint(&quadrant_assignment[&n2]){
                         if particle.collides_with(other) {
-                            collisions.insert((n, n2));
+                            collisions.insert(MappedPair::new(n, n2));
                         }
-                        checked_pairs.insert((n, n2));
-                        checked_pairs.insert((n2, n));
+                        checked_pairs.insert(MappedPair::new(n, n2));
                     }
                 }
             }
             // Handle the collisions between particles.
-            for (n, n2) in collisions {
-                let obj1 = self.objects.get(n);
-                let obj2 = self.objects.get(n2);
-                if obj1.is_some() && obj2.is_some() {
-                    let obj1 = obj1.unwrap();
-                    let obj2 = obj2.unwrap();
-                    let v1 = obj1.velocity;
-                    let v2 = obj2.velocity;
-
-                    let m1 = obj1.mass();
-                    let m2 = obj2.mass();
-
-                    let obj1_pos = obj1.geometry.position();
-                    let obj2_pos = obj2.geometry.position();
-
-                    let sys_mass = m1 + m2;
-                    if obj1.geometry.contains(&obj2_pos.x, &obj2_pos.y) ||
-                        obj2.geometry.contains(&obj1_pos.x, &obj1_pos.y) {
-                        // Merge them!
-                        let v_result = (m1 * v1 + m2 * v2) * (1.0 / sys_mass);
-
-
-                        let was_player = self.player_particles.is_some() &&
-                            (self.player_particles.unwrap() == n ||
-                                self.player_particles.unwrap() == n2);
-
-                        let mean_pos = (obj1_pos + obj2_pos) * 0.5;
-                        // r**2*pi = A r**2=A/pi r = sqrt(A/pi)
-                        let d3 = 2.0 * ((obj1.geometry.area() + obj2.geometry.area()) / PI).sqrt();
-
-                        let new = Particle::new(
-                            Box::new(Circle::new(mean_pos.x, mean_pos.y, d3)),
-                            v_result, Pair::zeros(), obj1.material);
-                        self.objects.remove(n);
-                        self.objects.remove(n2 - 1);
-
-                        if was_player {
-                            self.add_player(new);
-                        } else {
-                            self.add(new);
-                        }
-                    } else {
-                        let cr1 = 2.0 * obj1.material.elasticity /
-                            (obj1.material.elasticity + obj2.material.elasticity);
-                        let cr2 = 2.0 * obj2.material.elasticity /
-                            (obj1.material.elasticity + obj2.material.elasticity);
-                        let common_part = m1 * v1 + m2 * v2;
-                        let res1 = (common_part + m2 * cr1 * (v2 - v1)) * (1.0 / sys_mass);
-                        let res2 = (common_part + m1 * cr2 * (v1 - v2)) * (1.0 / sys_mass);
-
-                        // Teleport a bit to try to mitigate the stickiness
-
-                        {
-                            let mut obj1 = self.objects.get_mut(n).unwrap();
-                            obj1.set_velocity(res1);
-                            obj1.set_center(obj1.geometry.center()+res1.to_dir());
-                        }
-                        {
-                            let mut obj2 = self.objects.get_mut(n2).unwrap();
-                            obj2.set_velocity(res2);
-
-                            obj2.set_center(obj2.geometry.center()+res2.to_dir());
-                        }
-
-                    }
+            for pair in &collisions {
+                if !self.last_collisions.contains(&pair){
+                    valid_collisions.insert(*pair);
                 }
+
             }
+            self.last_collisions = collisions;
+            self.handle_collision_between(&valid_collisions);
         // Detect and model impact between playable area and particle.
+
         self.objects.iter_mut().for_each(|particle|
             self.playable_area.collision_modelling(particle));
         }
+    }
+
+    fn handle_collision_between(&mut self, validated_pairs: &HashSet<MappedPair<usize>>) {
+        let mut to_add: Vec<Particle> = Vec::new();
+
+        for pair in validated_pairs {
+
+            let obj1 = self.objects.get(*pair.first());
+            let obj2 = self.objects.get(*pair.second());
+            if obj1.is_some() && obj2.is_some() {
+                let obj1 = obj1.unwrap();
+                let obj2 = obj2.unwrap();
+                let v1 = obj1.velocity;
+                let v2 = obj2.velocity;
+
+                let m1 = obj1.mass();
+                let m2 = obj2.mass();
+
+                let obj1_pos = obj1.geometry.position();
+                let obj2_pos = obj2.geometry.position();
+
+                let sys_mass = &(m1 + m2);
+                if obj1.geometry.contains(&obj2_pos.x, &obj2_pos.y) ||
+                    obj2.geometry.contains(&obj1_pos.x, &obj1_pos.y) {
+                    // Merge them!
+                    let v_result = (m1 * v1 + m2 * v2) * (1.0 / sys_mass);
+
+
+                    let was_player = obj1.controller.is_player_controlled ||
+                        obj2.controller.is_player_controlled;
+
+                    let mean_pos = (obj1_pos + obj2_pos) * 0.5;
+                    // r**2*pi = A r**2=A/pi r = sqrt(A/pi)
+                    let d3 = 2.0 * ((obj1.geometry.area() + obj2.geometry.area()) / PI).sqrt();
+
+                    let mut new = Particle::new(
+                        Box::new(Circle::new(mean_pos.x, mean_pos.y, d3)),
+                        v_result, Pair::zeros(), obj1.material);
+
+
+                    if was_player {
+                        // If first was player controlled then p1 is set for new else p2, if both p1
+                        if obj1.controller.is_player_controlled {
+                            new.set_as_player(obj1.controller.get_id());
+                        } else {
+                            new.set_as_player(obj2.controller.get_id());
+                        }
+                    }
+
+                    to_add.push(new);
+                    self.objects.remove(*pair.first());
+                    if pair.first() < pair.second() {
+                        self.objects.remove(*pair.second() - 1);
+                    } else {
+                        self.objects.remove(*pair.second());
+                    }
+
+                } else {
+                    let cr1 = 2.0 * obj1.material.elasticity /
+                        (obj1.material.elasticity + obj2.material.elasticity);
+                    let cr2 = 2.0 * obj2.material.elasticity /
+                        (obj1.material.elasticity + obj2.material.elasticity);
+                    let common_part = m1 * v1 + m2 * v2;
+                    let res1 = (common_part + m2 * cr1 * (v2 - v1)) * (1.0 / sys_mass);
+                    let res2 = (common_part + m1 * cr2 * (v1 - v2)) * (1.0 / sys_mass);
+
+                    // Teleport a bit to try to mitigate the stickiness
+
+                    {
+                        let obj1 = self.objects.get_mut(*pair.first()).unwrap();
+                        obj1.set_velocity(res1*3.0);
+                        if TELEPORT_SHORT_DISTANCE_ON_IMPACT {
+                            obj1.set_center(obj1.geometry.center()+res1.to_dir());
+                        }
+                    }
+                    {
+                        let obj2 = self.objects.get_mut(*pair.second()).unwrap();
+                        obj2.set_velocity(res2*3.0);
+                        if TELEPORT_SHORT_DISTANCE_ON_IMPACT {
+                            obj2.set_center(obj2.geometry.center()+res2.to_dir());
+                        }
+                    }
+                    //self.last_collisions
+                }
+            }
+        }
+        self.objects.extend(to_add);
     }
 
     fn precise_occupies(&self, x: &f64, y: &f64) -> Vec<&Particle> {
@@ -835,16 +929,17 @@ impl ObjectCoordinator {
         occupying
     }
 
-    fn add(&mut self, particle: Particle) {
+    fn add(&mut self, mut particle: Particle) {
+        particle.controller.id = self.max_used_id as usize;
+        self.max_used_id += 1;
         self.objects.push(particle);
     }
-    fn try_add(&mut self, particle: Particle) -> bool {
+    fn add_will_work(&mut self, particle: &Particle) -> bool {
         if self.playable_area.collision_with_shape(&particle.geometry.shape()) {
             false
         } else {
             let coll = self.objects.iter().any(|p| p.collides_with(&particle));
             if !coll {
-                self.add(particle);
                 true
             } else {
                 false
@@ -862,13 +957,22 @@ impl ObjectCoordinator {
         diameter_sum/diameter_count
     }
 
-    fn apply_force_to_player(&mut self, force: Pair) {
-        self.objects.get_mut(self.player_particles.unwrap()).unwrap().apply_force(force);
+    fn apply_force_to_player(&mut self, player_id: usize, force: Pair) {
+        self.objects.iter_mut().filter(|p|
+            p.controller.is_player_controlled &&
+                p.controller.get_id() == player_id).
+            for_each(|p2| p2.apply_force(force));
     }
 
-    fn add_player(&mut self, particle: Particle) {
-        self.player_particles = Some(self.objects.len());
-        self.objects.push(particle);
+    fn add_player(&mut self, mut particle: Particle) -> Option<usize>{
+        if self.add_will_work(&particle) {
+            particle.controller = Controller::player(self.max_used_id as usize);
+            self.max_used_id += 1;
+            Some((self.max_used_id-1) as usize)
+        } else {
+            None
+        }
+
     }
 
     fn update(&mut self) {
@@ -905,13 +1009,22 @@ fn main() -> Result<(), Error> {
     };
 
     let mut state = ObjectCoordinator::new();
+    let mut added = false;
+    let mut player: Option<usize> = None;
 
-    state.add_player(Particle::new_random_circle());
+    while player.is_none() {
+        let particle = Particle::new_random_circle();
+        player = state.add_player(particle);
+    }
 
     for n in 0..NUMBER_OF_NON_PLAYER_PARTICLES {
-        let mut added = false;
+        added = false;
         while !added {
-            added = state.try_add(Particle::new_random_circle());
+            let particle = Particle::new_random_circle();
+            if state.add_will_work(&particle) {
+                state.add(particle);
+                added = true;
+            }
         }
     }
 
@@ -937,19 +1050,7 @@ fn main() -> Result<(), Error> {
                 return;
             } else if input.key_pressed(VirtualKeyCode::Space) {
                 state.toggle_pause();
-            }
-
-            if state.player_particles.is_none() || state.paused {
-
-            } else if input.key_held(VirtualKeyCode::Up) {
-                state.apply_force_to_player(Pair::new(0.0, -10000000.0))
-            } else if input.key_held(VirtualKeyCode::Down) {
-                state.apply_force_to_player(Pair::new(0.0, 10000000.0))}
-            else if input.key_held(VirtualKeyCode::Left) {
-                state.apply_force_to_player(Pair::new(-10000000.0, 0.0))}
-            else if input.key_held(VirtualKeyCode::Right) {
-                state.apply_force_to_player(Pair::new(10000000.0, 0.0))}
-            else if  input.key_pressed(VirtualKeyCode::Key1) {
+            } else if input.key_pressed(VirtualKeyCode::Key1) {
                 // Decrease energy in system
                 state.objects.iter_mut().for_each(|p| p.set_velocity(p.velocity*0.95));
             } else if input.key_pressed(VirtualKeyCode::Key2) {
@@ -957,6 +1058,17 @@ fn main() -> Result<(), Error> {
             } else if input.key_pressed(VirtualKeyCode::S) {
                 state.add(Particle::new_random_circle());
             }
+
+            if player.is_none() || state.paused {
+            } else if input.key_held(VirtualKeyCode::Up) {
+                state.apply_force_to_player(player.unwrap(), Pair::new(0.0, -10000000.0))
+            } else if input.key_held(VirtualKeyCode::Down) {
+                state.apply_force_to_player(player.unwrap(), Pair::new(0.0, 10000000.0))}
+            else if input.key_held(VirtualKeyCode::Left) {
+                state.apply_force_to_player(player.unwrap(), Pair::new(-10000000.0, 0.0))}
+            else if input.key_held(VirtualKeyCode::Right) {
+                state.apply_force_to_player(player.unwrap(), Pair::new(10000000.0, 0.0))}
+
 
 
             // Rewidth the window
