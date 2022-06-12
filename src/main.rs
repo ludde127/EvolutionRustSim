@@ -1,6 +1,8 @@
 #![deny(clippy::all)]
 #![forbid(unsafe_code)]
 
+extern crate core;
+
 mod life;
 
 use std::cmp::min;
@@ -26,7 +28,9 @@ const WIDTH_HEIGHT: (f64, f64) = (WIDTH_AS_F64, HEIGHT_AS_F64);
 const DENSITY: f64 = 997.0; // Kg/m3. waters density
 const DRAG_COEFFICIENT: f64 = 0.0;
 const PI: f64 = std::f64::consts::PI;
-const NUMBER_OF_NON_PLAYER_PARTICLES: u8 = 25;
+const NUMBER_OF_NON_PLAYER_PARTICLES: u8 = 15;
+const FISSION: bool = false;
+const C: f64 = 299792458.0;
 
 struct RGBA {
     r: u8,
@@ -85,6 +89,7 @@ impl BasicBox {
 }
 
 impl PlayableArea for BasicBox {
+
     fn contains(&self, x: &f64, y: &f64) -> bool {
         self.x_contains(x) && self.y_contains(y)
     }
@@ -99,6 +104,7 @@ impl PlayableArea for BasicBox {
                 shape.corners().iter().any(|(c0, c1)| !self.contains(c0, c1)),
         }
     }
+
 
     fn collision_modelling(&self, particle: &mut Particle) {
         let corner_outside_bounds = self.corners_outside_area(particle);
@@ -176,6 +182,11 @@ trait Geometry: std::fmt::Debug {
 enum Shape {
     Rectangle(Rectangle),
     Circle(Circle),
+}
+
+fn mass_to_energy(mass: f64) -> f64 {
+    // E=mc**2
+    mass * C.powf(2.0)
 }
 
 fn circle_rectangle_intersect(circle: &Circle, rectangle: &Rectangle) -> bool {
@@ -603,7 +614,7 @@ impl Particle {
     }
 
     fn new_random_circle() -> Self {
-        let diameter = random_in_bound(10..55);
+        let diameter = random_in_bound(10..20);
         let rand_pos = Pair::random_in_bound(
             ((diameter*1.1) as i32)..((WIDTH_AS_F64-(diameter*1.1)) as i32),
             ((diameter*1.1) as i32)..((HEIGHT_AS_F64-(diameter*1.1)) as i32)
@@ -642,6 +653,10 @@ impl Particle {
         self.dt = Instant::now(); // Reset the dt
     }
 
+    fn kinetic_energy(&self) -> f64 {
+        0.5*self.mass()*self.velocity.dot_prod(self.velocity)
+    }
+
     fn occupies(&self, x: &f64, y: &f64) -> bool {
         self.geometry.contains(x, y)
     }
@@ -676,12 +691,29 @@ impl Particle {
     fn set_center(&mut self, position: Pair) {
         self.geometry._move(position.x, position.y);
     }
+
+    fn fission(&self) -> (Particle, Particle) {
+        todo!();
+        let pos = self.geometry.position();
+        let extra_energy = mass_to_energy(sys_mass*0.001); // https://www.atomicarchive.com/science/fission/index.html
+            // Split obj2 A= (D**2 * pi)/4 => sqrt(4A/pi) = D
+        let p1 = Particle::new_still_circle(pos.x, pos.y,
+                                            (2.0*self.geometry.area()/PI).sqrt());
+        let p2 = Particle::new_still_circle(pos.x, pos.y,
+                                            (2.0*self.geometry.area()/PI).sqrt());
+
+        let total_velocity = (extra_energy + self.kinetic_energy()).sqrt()/self.mass(); // E = mv**2 v = sqrt(E)/m
+
+
+        todo!()
+        // Teleport a bit to try to mitigate the stickiness
+    }
 }
 
 fn assign_to_quadrants(shape: &Box<dyn Geometry>, median_diameter: f64) -> HashSet<(u8, u8)> {
     // Small quadrants seams to work best
-    let quadrant_width = 0.5*WIDTH_AS_F64/median_diameter;
-    let quadrant_height = 0.5*HEIGHT_AS_F64/median_diameter;
+    let quadrant_width = 1.5*WIDTH_AS_F64/median_diameter;
+    let quadrant_height = 1.5*HEIGHT_AS_F64/median_diameter;
     let hs: HashSet<(u8, u8)> = HashSet::from_iter(shape.corners().iter()
         .map(|cor| (((quadrant_width*(cor.0)/WIDTH_AS_F64) as u8),
                     ((quadrant_height*(cor.1)/HEIGHT_AS_F64) as u8)))
@@ -692,6 +724,7 @@ fn assign_to_quadrants(shape: &Box<dyn Geometry>, median_diameter: f64) -> HashS
 struct ObjectCoordinator {
     objects: Vec<Particle>,
     player_particles: Option<usize>,
+
     playable_area: Box<dyn PlayableArea>,
     paused: bool,
 }
@@ -726,30 +759,37 @@ impl ObjectCoordinator {
         self.objects.iter().any(|ps| ps.occupies(x, y))
     }
 
-    fn collision_handling(&mut self) {
-        // TODO MAKE THIS MORE EFFICIENT
-        if &self.objects.len() > &1 {
-            let mut checked_pairs: HashSet<(usize, usize)> = HashSet::new();
-            let mut collisions: HashSet<(usize, usize)> = HashSet::new();
+    fn collisions(&self) -> HashSet<(usize, usize)> {
+        let mut checked_pairs: HashSet<(usize, usize)> = HashSet::new();
+        let mut collisions: HashSet<(usize, usize)> = HashSet::new();
 
-            // Create the quadrants with the index of the particles in the storage vector instead.
-            let quadrant_assignment: HashMap<usize, HashSet<(u8, u8)>> =
-                HashMap::from_iter(self.objects.iter().enumerate()
-                    .map(|(n,p)| (n, assign_to_quadrants(&p.geometry,
-                                                         self.mean_diameter()))));
-            for (n, particle) in self.objects.iter().enumerate() {
-                for (n2, other) in self.objects.iter().enumerate() {
-                    if n != n2 && !checked_pairs.contains(&(n, n2))
-                        && !quadrant_assignment[&n].
-                            is_disjoint(&quadrant_assignment[&n2]){
-                        if particle.collides_with(other) {
-                            collisions.insert((n, n2));
-                        }
-                        checked_pairs.insert((n, n2));
-                        checked_pairs.insert((n2, n));
+        // Create the quadrants with the index of the particles in the storage vector instead.
+        let quadrant_assignment: HashMap<usize, HashSet<(u8, u8)>> =
+            HashMap::from_iter(self.objects.iter().enumerate()
+                .map(|(n,p)| (n, assign_to_quadrants(&p.geometry,
+                                                     self.mean_diameter()))));
+        for (n, particle) in self.objects.iter().enumerate() {
+            for (n2, other) in self.objects.iter().enumerate() {
+                if n != n2 && !checked_pairs.contains(&(n, n2))
+                    && !quadrant_assignment[&n].
+                    is_disjoint(&quadrant_assignment[&n2]){
+                    if particle.collides_with(other) {
+                        collisions.insert((n, n2));
                     }
+                    checked_pairs.insert((n, n2));
+                    checked_pairs.insert((n2, n));
                 }
             }
+        }
+        collisions
+    }
+
+    fn collision_handling(&mut self) {
+        // TODO MAKE THIS MORE EFFICIENT
+        let mut to_remove: Vec<usize> = vec![];
+        let mut to_add: Vec<(bool, Particle)> = vec![]; // bool is true if it should get added as player
+        if &self.objects.len() > &1 {
+            let collisions = self.collisions();
             // Handle the collisions between particles.
             for (n, n2) in collisions {
                 let obj1 = self.objects.get(n);
@@ -770,28 +810,46 @@ impl ObjectCoordinator {
                     if obj1.geometry.contains(&obj2_pos.x, &obj2_pos.y) ||
                         obj2.geometry.contains(&obj1_pos.x, &obj1_pos.y) {
                         // Merge them!
-                        let v_result = (m1 * v1 + m2 * v2) * (1.0 / sys_mass);
+                        let new_material = Material {
+                            density: (obj1.material.density*obj1.mass()
+                                + obj2.material.density*obj2.mass())/(obj1.mass()+obj2.mass()),
+                            elasticity: (obj1.material.elasticity*obj1.mass()
+                                + obj2.material.elasticity*obj2.mass())/(obj1.mass()+obj2.mass())};
+                        if !FISSION {
+                            let v_result = (m1 * v1 + m2 * v2) * (1.0 / sys_mass);
 
 
-                        let was_player = self.player_particles.is_some() &&
-                            (self.player_particles.unwrap() == n ||
-                                self.player_particles.unwrap() == n2);
+                            let was_player = self.player_particles.is_some() &&
+                                (self.player_particles.unwrap() == n ||
+                                    self.player_particles.unwrap() == n2);
 
-                        let mean_pos = (obj1_pos + obj2_pos) * 0.5;
-                        // r**2*pi = A r**2=A/pi r = sqrt(A/pi)
-                        let d3 = 2.0 * ((obj1.geometry.area() + obj2.geometry.area()) / PI).sqrt();
+                            let mean_pos = (obj1_pos + obj2_pos) * 0.5;
+                            // r**2*pi = A r**2=A/pi r = sqrt(A/pi)
+                            let d3 = 2.0 * ((obj1.geometry.area() + obj2.geometry.area()) / PI).sqrt();
 
-                        let new = Particle::new(
-                            Box::new(Circle::new(mean_pos.x, mean_pos.y, d3)),
-                            v_result, Pair::zeros(), obj1.material);
-                        self.objects.remove(n);
-                        self.objects.remove(n2 - 1);
+                            let new = Particle::new(
+                                Box::new(Circle::new(mean_pos.x, mean_pos.y, d3)),
+                                v_result, Pair::zeros(),
+                                new_material);
+                            to_remove.push(n);
+                            to_remove.push(n2);
+                            to_add.push((was_player, new));
 
-                        if was_player {
-                            self.add_player(new);
                         } else {
-                            self.add(new);
+                            let extra_energy = mass_to_energy(sys_mass*0.001); // https://www.atomicarchive.com/science/fission/index.html
+                            if obj1.kinetic_energy() > obj2.kinetic_energy() {
+                                // Split obj2 A= (D**2 * pi)/4 => sqrt(4A/pi) = D
+                                let obj3 = Particle::new_still_circle(obj2_pos.x, obj2_pos.y, (2.0*obj2.geometry.area()/PI).sqrt());
+                                let obj4 = Particle::new_still_circle(obj2_pos.x, obj2_pos.y, (2.0*obj2.geometry.area()/PI).sqrt());
+                                to_remove.push(n2);
+                            } else {
+                                // Split obj1
+                                to_remove.push(n)
+                            }
+                            // Teleport a bit to try to mitigate the stickiness
+
                         }
+
                     } else {
                         let cr1 = 2.0 * obj1.material.elasticity /
                             (obj1.material.elasticity + obj2.material.elasticity);
@@ -818,6 +876,16 @@ impl ObjectCoordinator {
                     }
                 }
             }
+        for n in to_remove {
+            self.objects.remove(n);
+        }
+        for (as_player, particle) in to_add {
+            if as_player {
+                self.add_player(particle);
+            } else {
+                self.add(particle);
+            }
+        }
         // Detect and model impact between playable area and particle.
         self.objects.iter_mut().for_each(|particle|
             self.playable_area.collision_modelling(particle));
@@ -951,9 +1019,9 @@ fn main() -> Result<(), Error> {
                 state.apply_force_to_player(Pair::new(10000000.0, 0.0))}
             else if  input.key_pressed(VirtualKeyCode::Key1) {
                 // Decrease energy in system
-                state.objects.iter_mut().for_each(|p| p.set_velocity(p.velocity*0.95));
+                state.objects.iter_mut().for_each(|p| p.set_velocity(p.velocity*0.90));
             } else if input.key_pressed(VirtualKeyCode::Key2) {
-                state.objects.iter_mut().for_each(|p| p.set_velocity(p.velocity*1.05));
+                state.objects.iter_mut().for_each(|p| p.set_velocity(p.velocity*1.10));
             } else if input.key_pressed(VirtualKeyCode::S) {
                 state.add(Particle::new_random_circle());
             }
